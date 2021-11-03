@@ -5,18 +5,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"runtime/debug"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 
-	cfg "github.com/tendermint/tendermint/config"
+	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/crypto"
 	cstypes "github.com/tendermint/tendermint/internal/consensus/types"
 	"github.com/tendermint/tendermint/internal/libs/fail"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
+	sm "github.com/tendermint/tendermint/internal/state"
 	tmevents "github.com/tendermint/tendermint/libs/events"
 	tmjson "github.com/tendermint/tendermint/libs/json"
 	"github.com/tendermint/tendermint/libs/log"
@@ -27,7 +28,6 @@ import (
 	"github.com/tendermint/tendermint/privval"
 	tmgrpc "github.com/tendermint/tendermint/privval/grpc"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -80,7 +80,7 @@ type State struct {
 	service.BaseService
 
 	// config details
-	config            *cfg.ConsensusConfig
+	config            *config.ConsensusConfig
 	privValidator     types.PrivValidator // for signing votes
 	privValidatorType types.PrivValidatorType
 
@@ -137,7 +137,7 @@ type State struct {
 	done chan struct{}
 
 	// synchronous pubsub between consensus state and reactor.
-	// state only emits EventNewRoundStep and EventVote
+	// state only emits EventNewRoundStep, EventValidBlock, and EventVote
 	evsw tmevents.EventSwitch
 
 	// for reporting metrics
@@ -152,7 +152,7 @@ type StateOption func(*State)
 
 // NewState returns a new State.
 func NewState(
-	config *cfg.ConsensusConfig,
+	cfg *config.ConsensusConfig,
 	state sm.State,
 	blockExec *sm.BlockExecutor,
 	blockStore sm.BlockStore,
@@ -161,7 +161,7 @@ func NewState(
 	options ...StateOption,
 ) *State {
 	cs := &State{
-		config:           config,
+		config:           cfg,
 		blockExec:        blockExec,
 		blockStore:       blockStore,
 		txNotifier:       txNotifier,
@@ -241,8 +241,12 @@ func (cs *State) GetLastHeight() int64 {
 // GetRoundState returns a shallow copy of the internal consensus state.
 func (cs *State) GetRoundState() *cstypes.RoundState {
 	cs.mtx.RLock()
+	defer cs.mtx.RUnlock()
+
+	// NOTE: this might be dodgy, as RoundState itself isn't thread
+	// safe as it contains a number of pointers and is explicitly
+	// not thread safe.
 	rs := cs.RoundState // copy
-	cs.mtx.RUnlock()
 	return &rs
 }
 
@@ -314,7 +318,14 @@ func (cs *State) LoadCommit(height int64) *types.Commit {
 	defer cs.mtx.RUnlock()
 
 	if height == cs.blockStore.Height() {
-		return cs.blockStore.LoadSeenCommit(height)
+		commit := cs.blockStore.LoadSeenCommit()
+		// NOTE: Retrieving the height of the most recent block and retrieving
+		// the most recent commit does not currently occur as an atomic
+		// operation. We check the height and commit here in case a more recent
+		// commit has arrived since retrieving the latest height.
+		if commit != nil && commit.Height == height {
+			return commit
+		}
 	}
 
 	return cs.blockStore.LoadBlockCommit(height)
@@ -594,15 +605,19 @@ func (cs *State) sendInternalMessage(mi msgInfo) {
 // Reconstruct LastCommit from SeenCommit, which we saved along with the block,
 // (which happens even before saving the state)
 func (cs *State) reconstructLastCommit(state sm.State) {
-	seenCommit := cs.blockStore.LoadSeenCommit(state.LastBlockHeight)
-	if seenCommit == nil {
+	commit := cs.blockStore.LoadSeenCommit()
+	if commit == nil || commit.Height != state.LastBlockHeight {
+		commit = cs.blockStore.LoadBlockCommit(state.LastBlockHeight)
+	}
+
+	if commit == nil {
 		panic(fmt.Sprintf(
-			"failed to reconstruct last commit; seen commit for height %v not found",
+			"failed to reconstruct last commit; commit for height %v not found",
 			state.LastBlockHeight,
 		))
 	}
 
-	lastPrecommits := types.CommitToVoteSet(state.ChainID, seenCommit, state.LastValidators)
+	lastPrecommits := types.CommitToVoteSet(state.ChainID, commit, state.LastValidators)
 	if !lastPrecommits.HasTwoThirdsMajority() {
 		panic("failed to reconstruct last commit; does not have +2/3 maj")
 	}
@@ -905,8 +920,8 @@ func (cs *State) handleMsg(mi msgInfo) {
 			"height", cs.Height,
 			"round", cs.Round,
 			"peer", peerID,
+			"msg_type", fmt.Sprintf("%T", msg),
 			"err", err,
-			"msg", msg,
 		)
 	}
 }
@@ -1882,7 +1897,7 @@ func (cs *State) addProposalBlockPart(msg *BlockPartMessage, peerID types.NodeID
 		)
 	}
 	if added && cs.ProposalBlockParts.IsComplete() {
-		bz, err := ioutil.ReadAll(cs.ProposalBlockParts.GetReader())
+		bz, err := io.ReadAll(cs.ProposalBlockParts.GetReader())
 		if err != nil {
 			return added, err
 		}
@@ -2218,6 +2233,7 @@ func (cs *State) signVote(
 
 	err := cs.privValidator.SignVote(ctx, cs.state.ChainID, v)
 	vote.Signature = v.Signature
+	vote.Timestamp = v.Timestamp
 
 	return vote, err
 }
@@ -2317,7 +2333,7 @@ func (cs *State) checkDoubleSigningRisk(height int64) error {
 		}
 
 		for i := int64(1); i < doubleSignCheckHeight; i++ {
-			lastCommit := cs.blockStore.LoadSeenCommit(height - i)
+			lastCommit := cs.LoadCommit(height - i)
 			if lastCommit != nil {
 				for sigIdx, s := range lastCommit.Signatures {
 					if s.BlockIDFlag == types.BlockIDFlagCommit && bytes.Equal(s.ValidatorAddress, valAddr) {

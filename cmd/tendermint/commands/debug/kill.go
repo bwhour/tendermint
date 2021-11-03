@@ -3,7 +3,6 @@ package debug
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +13,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	cfg "github.com/tendermint/tendermint/config"
+	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/libs/cli"
 	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
 )
@@ -50,13 +49,13 @@ func killCmdHandler(cmd *cobra.Command, args []string) error {
 	}
 
 	home := viper.GetString(cli.HomeFlag)
-	conf := cfg.DefaultConfig()
+	conf := config.DefaultConfig()
 	conf = conf.SetRoot(home)
-	cfg.EnsureRoot(conf.RootDir)
+	config.EnsureRoot(conf.RootDir)
 
 	// Create a temporary directory which will contain all the state dumps and
 	// relevant files and directories that will be compressed into a file.
-	tmpDir, err := ioutil.TempDir(os.TempDir(), "tendermint_debug_tmp")
+	tmpDir, err := os.MkdirTemp(os.TempDir(), "tendermint_debug_tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temporary directory: %w", err)
 	}

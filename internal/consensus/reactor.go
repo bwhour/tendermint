@@ -8,77 +8,62 @@ import (
 	cstypes "github.com/tendermint/tendermint/internal/consensus/types"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	"github.com/tendermint/tendermint/internal/p2p"
+	sm "github.com/tendermint/tendermint/internal/state"
 	"github.com/tendermint/tendermint/libs/bits"
 	tmevents "github.com/tendermint/tendermint/libs/events"
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
 	tmcons "github.com/tendermint/tendermint/proto/tendermint/consensus"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
-	sm "github.com/tendermint/tendermint/state"
 	"github.com/tendermint/tendermint/types"
 )
 
 var (
 	_ service.Service = (*Reactor)(nil)
 	_ p2p.Wrapper     = (*tmcons.Message)(nil)
+)
 
-	// ChannelShims contains a map of ChannelDescriptorShim objects, where each
-	// object wraps a reference to a legacy p2p ChannelDescriptor and the corresponding
-	// p2p proto.Message the new p2p Channel is responsible for handling.
-	//
-	//
-	// TODO: Remove once p2p refactor is complete.
-	// ref: https://github.com/tendermint/tendermint/issues/5670
-	ChannelShims = map[p2p.ChannelID]*p2p.ChannelDescriptorShim{
-		StateChannel: {
-			MsgType: new(tmcons.Message),
-			Descriptor: &p2p.ChannelDescriptor{
-				ID:                  byte(StateChannel),
-				Priority:            8,
-				SendQueueCapacity:   64,
-				RecvMessageCapacity: maxMsgSize,
-				RecvBufferCapacity:  128,
-				MaxSendBytes:        12000,
-			},
+// GetChannelDescriptor produces an instance of a descriptor for this
+// package's required channels.
+func GetChannelDescriptors() []*p2p.ChannelDescriptor {
+	return []*p2p.ChannelDescriptor{
+		{
+			ID:                  StateChannel,
+			MessageType:         new(tmcons.Message),
+			Priority:            8,
+			SendQueueCapacity:   64,
+			RecvMessageCapacity: maxMsgSize,
+			RecvBufferCapacity:  128,
 		},
-		DataChannel: {
-			MsgType: new(tmcons.Message),
-			Descriptor: &p2p.ChannelDescriptor{
-				// TODO: Consider a split between gossiping current block and catchup
-				// stuff. Once we gossip the whole block there is nothing left to send
-				// until next height or round.
-				ID:                  byte(DataChannel),
-				Priority:            12,
-				SendQueueCapacity:   64,
-				RecvBufferCapacity:  512,
-				RecvMessageCapacity: maxMsgSize,
-				MaxSendBytes:        40000,
-			},
+		{
+			// TODO: Consider a split between gossiping current block and catchup
+			// stuff. Once we gossip the whole block there is nothing left to send
+			// until next height or round.
+			ID:                  DataChannel,
+			MessageType:         new(tmcons.Message),
+			Priority:            12,
+			SendQueueCapacity:   64,
+			RecvBufferCapacity:  512,
+			RecvMessageCapacity: maxMsgSize,
 		},
-		VoteChannel: {
-			MsgType: new(tmcons.Message),
-			Descriptor: &p2p.ChannelDescriptor{
-				ID:                  byte(VoteChannel),
-				Priority:            10,
-				SendQueueCapacity:   64,
-				RecvBufferCapacity:  128,
-				RecvMessageCapacity: maxMsgSize,
-				MaxSendBytes:        150,
-			},
+		{
+			ID:                  VoteChannel,
+			MessageType:         new(tmcons.Message),
+			Priority:            10,
+			SendQueueCapacity:   64,
+			RecvBufferCapacity:  128,
+			RecvMessageCapacity: maxMsgSize,
 		},
-		VoteSetBitsChannel: {
-			MsgType: new(tmcons.Message),
-			Descriptor: &p2p.ChannelDescriptor{
-				ID:                  byte(VoteSetBitsChannel),
-				Priority:            5,
-				SendQueueCapacity:   8,
-				RecvBufferCapacity:  128,
-				RecvMessageCapacity: maxMsgSize,
-				MaxSendBytes:        50,
-			},
+		{
+			ID:                  VoteSetBitsChannel,
+			MessageType:         new(tmcons.Message),
+			Priority:            5,
+			SendQueueCapacity:   8,
+			RecvBufferCapacity:  128,
+			RecvMessageCapacity: maxMsgSize,
 		},
 	}
-)
+}
 
 const (
 	StateChannel       = p2p.ChannelID(0x20)
@@ -96,20 +81,28 @@ const (
 
 type ReactorOption func(*Reactor)
 
-// Temporary interface for switching to fast sync, we should get rid of v0.
+// NOTE: Temporary interface for switching to block sync, we should get rid of v0.
 // See: https://github.com/tendermint/tendermint/issues/4595
-type FastSyncReactor interface {
-	SwitchToFastSync(sm.State) error
+type BlockSyncReactor interface {
+	SwitchToBlockSync(sm.State) error
 
 	GetMaxPeerBlockHeight() int64
 
-	// GetTotalSyncedTime returns the time duration since the fastsync starting.
+	// GetTotalSyncedTime returns the time duration since the blocksync starting.
 	GetTotalSyncedTime() time.Duration
 
 	// GetRemainingSyncTime returns the estimating time the node will be fully synced,
-	// if will return 0 if the fastsync does not perform or the number of block synced is
+	// if will return 0 if the blocksync does not perform or the number of block synced is
 	// too small (less than 100).
 	GetRemainingSyncTime() time.Duration
+}
+
+//go:generate ../../scripts/mockery_generate.sh ConsSyncReactor
+// ConsSyncReactor defines an interface used for testing abilities of node.startStateSync.
+type ConsSyncReactor interface {
+	SwitchToConsensus(sm.State, bool)
+	SetStateSyncingMetrics(float64)
+	SetBlockSyncingMetrics(float64)
 }
 
 // Reactor defines a reactor for the consensus service.
@@ -222,16 +215,14 @@ func (r *Reactor) OnStop() {
 	}
 
 	r.mtx.Lock()
-	peers := r.peers
+	// Close and wait for each of the peers to shutdown.
+	// This is safe to perform with the lock since none of the peers require the
+	// lock to complete any of the methods that the waitgroup is waiting on.
+	for _, state := range r.peers {
+		state.closer.Close()
+		state.broadcastWG.Wait()
+	}
 	r.mtx.Unlock()
-
-	// wait for all spawned peer goroutines to gracefully exit
-	for _, ps := range peers {
-		ps.closer.Close()
-	}
-	for _, ps := range peers {
-		ps.broadcastWG.Wait()
-	}
 
 	// Close the StateChannel goroutine separately since it uses its own channel
 	// to signal closure.
@@ -257,7 +248,7 @@ func (r *Reactor) SetEventBus(b *types.EventBus) {
 	r.state.SetEventBus(b)
 }
 
-// WaitSync returns whether the consensus reactor is waiting for state/fast sync.
+// WaitSync returns whether the consensus reactor is waiting for state/block sync.
 func (r *Reactor) WaitSync() bool {
 	r.mtx.RLock()
 	defer r.mtx.RUnlock()
@@ -270,8 +261,8 @@ func ReactorMetrics(metrics *Metrics) ReactorOption {
 	return func(r *Reactor) { r.Metrics = metrics }
 }
 
-// SwitchToConsensus switches from fast-sync mode to consensus mode. It resets
-// the state, turns off fast-sync, and starts the consensus state-machine.
+// SwitchToConsensus switches from block-sync mode to consensus mode. It resets
+// the state, turns off block-sync, and starts the consensus state-machine.
 func (r *Reactor) SwitchToConsensus(state sm.State, skipWAL bool) {
 	r.Logger.Info("switching to consensus")
 
@@ -288,7 +279,7 @@ func (r *Reactor) SwitchToConsensus(state sm.State, skipWAL bool) {
 	r.waitSync = false
 	r.mtx.Unlock()
 
-	r.Metrics.FastSyncing.Set(0)
+	r.Metrics.BlockSyncing.Set(0)
 	r.Metrics.StateSyncing.Set(0)
 
 	if skipWAL {
@@ -303,6 +294,11 @@ conS:
 
 conR:
 %+v`, err, r.state, r))
+	}
+
+	d := types.EventDataBlockSyncStatus{Complete: true, Height: state.LastBlockHeight}
+	if err := r.eventBus.PublishEventBlockSyncStatus(d); err != nil {
+		r.Logger.Error("failed to emit the blocksync complete event", "err", err)
 	}
 }
 
@@ -956,7 +952,7 @@ func (r *Reactor) processPeerUpdate(peerUpdate p2p.PeerUpdate) {
 			go r.gossipVotesRoutine(ps)
 			go r.queryMaj23Routine(ps)
 
-			// Send our state to the peer. If we're fast-syncing, broadcast a
+			// Send our state to the peer. If we're block-syncing, broadcast a
 			// RoundStepMessage later upon SwitchToConsensus().
 			if !r.waitSync {
 				go r.sendNewRoundStepMessage(ps.peerID)
@@ -1083,7 +1079,7 @@ func (r *Reactor) handleDataMessage(envelope p2p.Envelope, msgI Message) error {
 	}
 
 	if r.WaitSync() {
-		logger.Info("ignoring message received during sync", "msg", msgI)
+		logger.Info("ignoring message received during sync", "msg", fmt.Sprintf("%T", msgI))
 		return nil
 	}
 
@@ -1206,7 +1202,7 @@ func (r *Reactor) handleVoteSetBitsMessage(envelope p2p.Envelope, msgI Message) 
 // It will handle errors and any possible panics gracefully. A caller can handle
 // any error returned by sending a PeerError on the respective channel.
 //
-// NOTE: We process these messages even when we're fast_syncing. Messages affect
+// NOTE: We process these messages even when we're block syncing. Messages affect
 // either a peer state or the consensus state. Peer state updates can happen in
 // parallel, but processing of proposals, block parts, and votes are ordered by
 // the p2p channel.
@@ -1423,4 +1419,12 @@ func (r *Reactor) peerStatsRoutine() {
 
 func (r *Reactor) GetConsensusState() *State {
 	return r.state
+}
+
+func (r *Reactor) SetStateSyncingMetrics(v float64) {
+	r.Metrics.StateSyncing.Set(v)
+}
+
+func (r *Reactor) SetBlockSyncingMetrics(v float64) {
+	r.Metrics.BlockSyncing.Set(v)
 }

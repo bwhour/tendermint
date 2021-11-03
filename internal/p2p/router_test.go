@@ -50,7 +50,7 @@ func TestRouter_Network(t *testing.T) {
 	network := p2ptest.MakeNetwork(t, p2ptest.NetworkOptions{NumNodes: 8})
 	local := network.RandomNode()
 	peers := network.Peers(local.NodeID)
-	channels := network.MakeChannels(t, chDesc, &p2ptest.Message{}, 0)
+	channels := network.MakeChannels(t, chDesc)
 
 	network.Start(t)
 
@@ -109,6 +109,7 @@ func TestRouter_Channel_Basic(t *testing.T) {
 		selfKey,
 		peerManager,
 		nil,
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -119,25 +120,26 @@ func TestRouter_Channel_Basic(t *testing.T) {
 	})
 
 	// Opening a channel should work.
-	channel, err := router.OpenChannel(chDesc, &p2ptest.Message{}, 0)
+	channel, err := router.OpenChannel(chDesc)
 	require.NoError(t, err)
-	require.Contains(t, router.NodeInfo().Channels, chDesc.ID)
+	require.Contains(t, router.NodeInfo().Channels, byte(chDesc.ID))
 
 	// Opening the same channel again should fail.
-	_, err = router.OpenChannel(chDesc, &p2ptest.Message{}, 0)
+	_, err = router.OpenChannel(chDesc)
 	require.Error(t, err)
 
 	// Opening a different channel should work.
-	chDesc2 := p2p.ChannelDescriptor{ID: byte(2)}
-	_, err = router.OpenChannel(chDesc2, &p2ptest.Message{}, 0)
+	chDesc2 := &p2p.ChannelDescriptor{ID: 2, MessageType: &p2ptest.Message{}}
+	_, err = router.OpenChannel(chDesc2)
+
 	require.NoError(t, err)
-	require.Contains(t, router.NodeInfo().Channels, chDesc2.ID)
+	require.Contains(t, router.NodeInfo().Channels, byte(chDesc2.ID))
 
 	// Closing the channel, then opening it again should be fine.
 	channel.Close()
 	time.Sleep(100 * time.Millisecond) // yes yes, but Close() is async...
 
-	channel, err = router.OpenChannel(chDesc, &p2ptest.Message{}, 0)
+	channel, err = router.OpenChannel(chDesc)
 	require.NoError(t, err)
 
 	// We should be able to send on the channel, even though there are no peers.
@@ -163,9 +165,9 @@ func TestRouter_Channel_SendReceive(t *testing.T) {
 
 	ids := network.NodeIDs()
 	aID, bID, cID := ids[0], ids[1], ids[2]
-	channels := network.MakeChannels(t, chDesc, &p2ptest.Message{}, 0)
+	channels := network.MakeChannels(t, chDesc)
 	a, b, c := channels[aID], channels[bID], channels[cID]
-	otherChannels := network.MakeChannels(t, p2ptest.MakeChannelDesc(9), &p2ptest.Message{}, 0)
+	otherChannels := network.MakeChannels(t, p2ptest.MakeChannelDesc(9))
 
 	network.Start(t)
 
@@ -222,7 +224,7 @@ func TestRouter_Channel_Broadcast(t *testing.T) {
 
 	ids := network.NodeIDs()
 	aID, bID, cID, dID := ids[0], ids[1], ids[2], ids[3]
-	channels := network.MakeChannels(t, chDesc, &p2ptest.Message{}, 0)
+	channels := network.MakeChannels(t, chDesc)
 	a, b, c, d := channels[aID], channels[bID], channels[cID], channels[dID]
 
 	network.Start(t)
@@ -250,7 +252,15 @@ func TestRouter_Channel_Wrapper(t *testing.T) {
 
 	ids := network.NodeIDs()
 	aID, bID := ids[0], ids[1]
-	channels := network.MakeChannels(t, chDesc, &wrapperMessage{}, 0)
+	chDesc := &p2p.ChannelDescriptor{
+		ID:                  chID,
+		MessageType:         &wrapperMessage{},
+		Priority:            5,
+		SendQueueCapacity:   10,
+		RecvMessageCapacity: 10,
+	}
+
+	channels := network.MakeChannels(t, chDesc)
 	a, b := channels[aID], channels[bID]
 
 	network.Start(t)
@@ -310,7 +320,7 @@ func TestRouter_Channel_Error(t *testing.T) {
 
 	ids := network.NodeIDs()
 	aID, bID := ids[0], ids[1]
-	channels := network.MakeChannels(t, chDesc, &p2ptest.Message{}, 0)
+	channels := network.MakeChannels(t, chDesc)
 	a := channels[aID]
 
 	// Erroring b should cause it to be disconnected. It will reconnect shortly after.
@@ -367,7 +377,7 @@ func TestRouter_AcceptPeers(t *testing.T) {
 			mockTransport.On("Protocols").Return([]p2p.Protocol{"mock"})
 			mockTransport.On("Close").Return(nil)
 			mockTransport.On("Accept").Once().Return(mockConnection, nil)
-			mockTransport.On("Accept").Once().Return(nil, io.EOF)
+			mockTransport.On("Accept").Maybe().Return(nil, io.EOF)
 
 			// Set up and start the router.
 			peerManager, err := p2p.NewPeerManager(selfID, dbm.NewMemDB(), p2p.PeerManagerOptions{})
@@ -384,6 +394,7 @@ func TestRouter_AcceptPeers(t *testing.T) {
 				selfKey,
 				peerManager,
 				[]p2p.Transport{mockTransport},
+				nil,
 				p2p.RouterOptions{},
 			)
 			require.NoError(t, err)
@@ -436,6 +447,7 @@ func TestRouter_AcceptPeers_Error(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -470,6 +482,7 @@ func TestRouter_AcceptPeers_ErrorEOF(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -518,6 +531,7 @@ func TestRouter_AcceptPeers_HeadOfLineBlocking(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -617,6 +631,7 @@ func TestRouter_DialPeers(t *testing.T) {
 				selfKey,
 				peerManager,
 				[]p2p.Transport{mockTransport},
+				nil,
 				p2p.RouterOptions{},
 			)
 			require.NoError(t, err)
@@ -700,6 +715,7 @@ func TestRouter_DialPeers_Parallel(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{
 			DialSleep: func(_ context.Context) {},
 			NumConcurrentDials: func() int {
@@ -755,7 +771,7 @@ func TestRouter_EvictPeers(t *testing.T) {
 	mockTransport.On("Protocols").Return([]p2p.Protocol{"mock"})
 	mockTransport.On("Close").Return(nil)
 	mockTransport.On("Accept").Once().Return(mockConnection, nil)
-	mockTransport.On("Accept").Once().Return(nil, io.EOF)
+	mockTransport.On("Accept").Maybe().Return(nil, io.EOF)
 
 	// Set up and start the router.
 	peerManager, err := p2p.NewPeerManager(selfID, dbm.NewMemDB(), p2p.PeerManagerOptions{})
@@ -772,6 +788,7 @@ func TestRouter_EvictPeers(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -833,6 +850,7 @@ func TestRouter_ChannelCompatability(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -865,11 +883,12 @@ func TestRouter_DontSendOnInvalidChannel(t *testing.T) {
 	mockConnection.On("ReceiveMessage").Return(chID, nil, io.EOF)
 
 	mockTransport := &mocks.Transport{}
+	mockTransport.On("AddChannelDescriptors", mock.Anything).Return()
 	mockTransport.On("String").Maybe().Return("mock")
 	mockTransport.On("Protocols").Return([]p2p.Protocol{"mock"})
 	mockTransport.On("Close").Return(nil)
 	mockTransport.On("Accept").Once().Return(mockConnection, nil)
-	mockTransport.On("Accept").Once().Return(nil, io.EOF)
+	mockTransport.On("Accept").Maybe().Return(nil, io.EOF)
 
 	// Set up and start the router.
 	peerManager, err := p2p.NewPeerManager(selfID, dbm.NewMemDB(), p2p.PeerManagerOptions{})
@@ -886,6 +905,7 @@ func TestRouter_DontSendOnInvalidChannel(t *testing.T) {
 		selfKey,
 		peerManager,
 		[]p2p.Transport{mockTransport},
+		nil,
 		p2p.RouterOptions{},
 	)
 	require.NoError(t, err)
@@ -896,7 +916,7 @@ func TestRouter_DontSendOnInvalidChannel(t *testing.T) {
 		Status: p2p.PeerStatusUp,
 	})
 
-	channel, err := router.OpenChannel(chDesc, &p2ptest.Message{}, 0)
+	channel, err := router.OpenChannel(chDesc)
 	require.NoError(t, err)
 
 	channel.Out <- p2p.Envelope{

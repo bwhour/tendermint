@@ -25,7 +25,7 @@ func TestBlockQueueBasic(t *testing.T) {
 	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
 	require.NoError(t, err)
 
-	queue := newBlockQueue(startHeight, stopHeight, stopTime, 1)
+	queue := newBlockQueue(startHeight, stopHeight, 1, stopTime, 1)
 	wg := &sync.WaitGroup{}
 
 	// asynchronously fetch blocks and add it to the queue
@@ -58,7 +58,7 @@ loop:
 			// assert that the queue serializes the blocks
 			require.Equal(t, resp.block.Height, trackingHeight)
 			trackingHeight--
-			queue.success(resp.block.Height)
+			queue.success()
 		}
 
 	}
@@ -72,7 +72,7 @@ func TestBlockQueueWithFailures(t *testing.T) {
 	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
 	require.NoError(t, err)
 
-	queue := newBlockQueue(startHeight, stopHeight, stopTime, 200)
+	queue := newBlockQueue(startHeight, stopHeight, 1, stopTime, 200)
 	wg := &sync.WaitGroup{}
 
 	failureRate := 4
@@ -105,7 +105,7 @@ func TestBlockQueueWithFailures(t *testing.T) {
 				queue.retry(resp.block.Height)
 			} else {
 				trackingHeight--
-				queue.success(resp.block.Height)
+				queue.success()
 			}
 
 		case <-queue.done():
@@ -121,7 +121,7 @@ func TestBlockQueueWithFailures(t *testing.T) {
 func TestBlockQueueBlocks(t *testing.T) {
 	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
 	require.NoError(t, err)
-	queue := newBlockQueue(startHeight, stopHeight, stopTime, 2)
+	queue := newBlockQueue(startHeight, stopHeight, 1, stopTime, 2)
 	expectedHeight := startHeight
 	retryHeight := stopHeight + 2
 
@@ -168,7 +168,7 @@ loop:
 func TestBlockQueueAcceptsNoMoreBlocks(t *testing.T) {
 	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
 	require.NoError(t, err)
-	queue := newBlockQueue(startHeight, stopHeight, stopTime, 1)
+	queue := newBlockQueue(startHeight, stopHeight, 1, stopTime, 1)
 	defer queue.close()
 
 loop:
@@ -194,7 +194,7 @@ func TestBlockQueueStopTime(t *testing.T) {
 	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
 	require.NoError(t, err)
 
-	queue := newBlockQueue(startHeight, stopHeight, stopTime, 1)
+	queue := newBlockQueue(startHeight, stopHeight, 1, stopTime, 1)
 	wg := &sync.WaitGroup{}
 
 	baseTime := stopTime.Add(-50 * time.Second)
@@ -223,7 +223,7 @@ func TestBlockQueueStopTime(t *testing.T) {
 			// assert that the queue serializes the blocks
 			assert.Equal(t, resp.block.Height, trackingHeight)
 			trackingHeight--
-			queue.success(resp.block.Height)
+			queue.success()
 
 		case <-queue.done():
 			wg.Wait()
@@ -233,9 +233,51 @@ func TestBlockQueueStopTime(t *testing.T) {
 	}
 }
 
+func TestBlockQueueInitialHeight(t *testing.T) {
+	peerID, err := types.NewNodeID("0011223344556677889900112233445566778899")
+	require.NoError(t, err)
+	const initialHeight int64 = 120
+
+	queue := newBlockQueue(startHeight, stopHeight, initialHeight, stopTime, 1)
+	wg := &sync.WaitGroup{}
+
+	// asynchronously fetch blocks and add it to the queue
+	for i := 0; i <= numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			for {
+				select {
+				case height := <-queue.nextHeight():
+					require.GreaterOrEqual(t, height, initialHeight)
+					queue.add(mockLBResp(t, peerID, height, endTime))
+				case <-queue.done():
+					wg.Done()
+					return
+				}
+			}
+		}()
+	}
+
+loop:
+	for {
+		select {
+		case <-queue.done():
+			wg.Wait()
+			require.NoError(t, queue.error())
+			break loop
+
+		case resp := <-queue.verifyNext():
+			require.GreaterOrEqual(t, resp.block.Height, initialHeight)
+			queue.success()
+		}
+	}
+}
+
 func mockLBResp(t *testing.T, peer types.NodeID, height int64, time time.Time) lightBlockResponse {
+	vals, pv := factory.RandValidatorSet(3, 10)
+	_, _, lb := mockLB(t, height, time, factory.MakeBlockID(), vals, pv)
 	return lightBlockResponse{
-		block: mockLB(t, height, time, factory.MakeBlockID()),
+		block: lb,
 		peer:  peer,
 	}
 }

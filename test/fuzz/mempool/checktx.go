@@ -1,21 +1,22 @@
-package checktx
+package mempool
 
 import (
 	"context"
 
+	abciclient "github.com/tendermint/tendermint/abci/client"
 	"github.com/tendermint/tendermint/abci/example/kvstore"
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/internal/mempool"
-	mempoolv0 "github.com/tendermint/tendermint/internal/mempool/v0"
-	"github.com/tendermint/tendermint/proxy"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
-var mp mempool.Mempool
+var mp *mempool.TxMempool
+var getMp func() mempool.Mempool
 
 func init() {
 	app := kvstore.NewApplication()
-	cc := proxy.NewLocalClientCreator(app)
-	appConnMem, _ := cc.NewABCIClient()
+	cc := abciclient.NewLocalCreator(app)
+	appConnMem, _ := cc()
 	err := appConnMem.Start()
 	if err != nil {
 		panic(err)
@@ -24,11 +25,22 @@ func init() {
 	cfg := config.DefaultMempoolConfig()
 	cfg.Broadcast = false
 
-	mp = mempoolv0.NewCListMempool(cfg, appConnMem, 0)
+	getMp = func() mempool.Mempool {
+		if mp == nil {
+			mp = mempool.NewTxMempool(
+				log.TestingLogger().With("module", "mempool"),
+				cfg,
+				appConnMem,
+				0,
+			)
+
+		}
+		return mp
+	}
 }
 
 func Fuzz(data []byte) int {
-	err := mp.CheckTx(context.Background(), data, nil, mempool.TxInfo{})
+	err := getMp().CheckTx(context.Background(), data, nil, mempool.TxInfo{})
 	if err != nil {
 		return 0
 	}
