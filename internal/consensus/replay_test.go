@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -24,6 +25,7 @@ import (
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/encoding"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/mempool"
 	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
@@ -31,6 +33,7 @@ import (
 	"github.com/tendermint/tendermint/internal/store"
 	"github.com/tendermint/tendermint/internal/test/factory"
 	"github.com/tendermint/tendermint/libs/log"
+	"github.com/tendermint/tendermint/libs/pubsub"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	"github.com/tendermint/tendermint/privval"
 	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
@@ -61,13 +64,13 @@ func startNewStateAndWaitForBlock(t *testing.T, consensusReplayConfig *config.Co
 	privValidator := loadPrivValidator(consensusReplayConfig)
 	blockStore := store.NewBlockStore(dbm.NewMemDB())
 	cs := newStateWithConfigAndBlockStore(
+		logger,
 		consensusReplayConfig,
 		state,
 		privValidator,
 		kvstore.NewApplication(),
 		blockStore,
 	)
-	cs.SetLogger(logger)
 
 	bytes, _ := os.ReadFile(cs.config.WalFile())
 	t.Logf("====== WAL: \n\r%X\n", bytes)
@@ -84,14 +87,18 @@ func startNewStateAndWaitForBlock(t *testing.T, consensusReplayConfig *config.Co
 	// in the WAL itself. Assuming the consensus state is running, replay of any
 	// WAL, including the empty one, should eventually be followed by a new
 	// block, or else something is wrong.
-	newBlockSub, err := cs.eventBus.Subscribe(context.Background(), testSubscriber, types.EventQueryNewBlock)
+	newBlockSub, err := cs.eventBus.SubscribeWithArgs(context.Background(), pubsub.SubscribeArgs{
+		ClientID: testSubscriber,
+		Query:    types.EventQueryNewBlock,
+	})
 	require.NoError(t, err)
-	select {
-	case <-newBlockSub.Out():
-	case <-newBlockSub.Canceled():
-		t.Fatal("newBlockSub was canceled")
-	case <-time.After(120 * time.Second):
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	_, err = newBlockSub.Next(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
 		t.Fatal("Timed out waiting for new block (see trace above)")
+	} else if err != nil {
+		t.Fatal("newBlockSub was canceled")
 	}
 }
 
@@ -157,13 +164,13 @@ LOOP:
 		require.NoError(t, err)
 		privValidator := loadPrivValidator(consensusReplayConfig)
 		cs := newStateWithConfigAndBlockStore(
+			logger,
 			consensusReplayConfig,
 			state,
 			privValidator,
 			kvstore.NewApplication(),
 			blockStore,
 		)
-		cs.SetLogger(logger)
 
 		// start sending transactions
 		ctx, cancel := context.WithCancel(context.Background())
@@ -334,8 +341,8 @@ func setupSimulator(t *testing.T) *simulatorTestSuite {
 
 	partSize := types.BlockPartSizeBytes
 
-	newRoundCh := subscribe(css[0].eventBus, types.EventQueryNewRound)
-	proposalCh := subscribe(css[0].eventBus, types.EventQueryCompleteProposal)
+	newRoundCh := subscribe(t, css[0].eventBus, types.EventQueryNewRound)
+	proposalCh := subscribe(t, css[0].eventBus, types.EventQueryCompleteProposal)
 
 	vss := make([]*validatorStub, nPeers)
 	for i := 0; i < nPeers; i++ {
@@ -632,7 +639,7 @@ func TestMockProxyApp(t *testing.T) {
 		err = proto.Unmarshal(bytes, loadedAbciRes)
 		require.NoError(t, err)
 
-		mock := newMockProxyApp([]byte("mock_hash"), loadedAbciRes)
+		mock := newMockProxyApp(logger, []byte("mock_hash"), loadedAbciRes)
 
 		abciRes := new(tmstate.ABCIResponses)
 		abciRes.DeliverTxs = make([]*abci.ResponseDeliverTx, len(loadedAbciRes.DeliverTxs))
@@ -689,6 +696,7 @@ func testHandshakeReplay(t *testing.T, sim *simulatorTestSuite, nBlocks int, mod
 
 	cfg := sim.Config
 
+	logger := log.TestingLogger()
 	if testValidatorsChange {
 		testConfig, err := ResetConfig(fmt.Sprintf("%s_%v_m", t.Name(), mode))
 		require.NoError(t, err)
@@ -712,9 +720,8 @@ func testHandshakeReplay(t *testing.T, sim *simulatorTestSuite, nBlocks int, mod
 		privVal, err := privval.LoadFilePV(cfg.PrivValidator.KeyFile(), cfg.PrivValidator.StateFile())
 		require.NoError(t, err)
 
-		wal, err := NewWAL(walFile)
+		wal, err := NewWAL(logger, walFile)
 		require.NoError(t, err)
-		wal.SetLogger(log.TestingLogger())
 		err = wal.Start()
 		require.NoError(t, err)
 		t.Cleanup(func() {
@@ -735,7 +742,7 @@ func testHandshakeReplay(t *testing.T, sim *simulatorTestSuite, nBlocks int, mod
 
 	state := genesisState.Copy()
 	// run the chain through state.ApplyBlock to build up the tendermint state
-	state = buildTMStateFromChain(cfg, sim.Mempool, sim.Evpool, stateStore, state, chain, nBlocks, mode, store)
+	state = buildTMStateFromChain(cfg, logger, sim.Mempool, sim.Evpool, stateStore, state, chain, nBlocks, mode, store)
 	latestAppHash := state.AppHash
 
 	// make a new client creator
@@ -747,7 +754,7 @@ func testHandshakeReplay(t *testing.T, sim *simulatorTestSuite, nBlocks int, mod
 	if nBlocks > 0 {
 		// run nBlocks against a new client to build up the app state.
 		// use a throwaway tendermint state
-		proxyApp := proxy.NewAppConns(clientCreator2, proxy.NopMetrics())
+		proxyApp := proxy.NewAppConns(clientCreator2, logger, proxy.NopMetrics())
 		stateDB1 := dbm.NewMemDB()
 		stateStore := sm.NewStore(stateDB1)
 		err := stateStore.Save(genesisState)
@@ -766,8 +773,8 @@ func testHandshakeReplay(t *testing.T, sim *simulatorTestSuite, nBlocks int, mod
 
 	// now start the app using the handshake - it should sync
 	genDoc, _ := sm.MakeGenesisDocFromFile(cfg.GenesisFile())
-	handshaker := NewHandshaker(stateStore, state, store, genDoc)
-	proxyApp := proxy.NewAppConns(clientCreator2, proxy.NopMetrics())
+	handshaker := NewHandshaker(logger, stateStore, state, store, eventbus.NopEventBus{}, genDoc)
+	proxyApp := proxy.NewAppConns(clientCreator2, logger, proxy.NopMetrics())
 	if err := proxyApp.Start(); err != nil {
 		t.Fatalf("Error starting proxy app connections: %v", err)
 	}
@@ -881,6 +888,7 @@ func buildAppStateFromChain(
 
 func buildTMStateFromChain(
 	cfg *config.Config,
+	logger log.Logger,
 	mempool mempool.Mempool,
 	evpool sm.EvidencePool,
 	stateStore sm.Store,
@@ -888,14 +896,15 @@ func buildTMStateFromChain(
 	chain []*types.Block,
 	nBlocks int,
 	mode uint,
-	blockStore *mockBlockStore) sm.State {
+	blockStore *mockBlockStore,
+) sm.State {
 	// run the whole chain against this client to build up the tendermint state
 	kvstoreApp := kvstore.NewPersistentKVStoreApplication(
 		filepath.Join(cfg.DBDir(), fmt.Sprintf("replay_test_%d_%d_t", nBlocks, mode)))
 	defer kvstoreApp.Close()
 	clientCreator := abciclient.NewLocalCreator(kvstoreApp)
 
-	proxyApp := proxy.NewAppConns(clientCreator, proxy.NopMetrics())
+	proxyApp := proxy.NewAppConns(clientCreator, logger, proxy.NopMetrics())
 	if err := proxyApp.Start(); err != nil {
 		panic(err)
 	}
@@ -956,6 +965,8 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 	blocks := sf.MakeBlocks(3, &state, privVal)
 	store.chain = blocks
 
+	logger := log.TestingLogger()
+
 	// 2. Tendermint must panic if app returns wrong hash for the first block
 	//		- RANDOM HASH
 	//		- 0x02
@@ -963,7 +974,7 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 	{
 		app := &badApp{numBlocks: 3, allHashesAreWrong: true}
 		clientCreator := abciclient.NewLocalCreator(app)
-		proxyApp := proxy.NewAppConns(clientCreator, proxy.NopMetrics())
+		proxyApp := proxy.NewAppConns(clientCreator, logger, proxy.NopMetrics())
 		err := proxyApp.Start()
 		require.NoError(t, err)
 		t.Cleanup(func() {
@@ -973,7 +984,7 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 		})
 
 		assert.Panics(t, func() {
-			h := NewHandshaker(stateStore, state, store, genDoc)
+			h := NewHandshaker(logger, stateStore, state, store, eventbus.NopEventBus{}, genDoc)
 			if err = h.Handshake(proxyApp); err != nil {
 				t.Log(err)
 			}
@@ -987,7 +998,7 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 	{
 		app := &badApp{numBlocks: 3, onlyLastHashIsWrong: true}
 		clientCreator := abciclient.NewLocalCreator(app)
-		proxyApp := proxy.NewAppConns(clientCreator, proxy.NopMetrics())
+		proxyApp := proxy.NewAppConns(clientCreator, logger, proxy.NopMetrics())
 		err := proxyApp.Start()
 		require.NoError(t, err)
 		t.Cleanup(func() {
@@ -997,7 +1008,7 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 		})
 
 		assert.Panics(t, func() {
-			h := NewHandshaker(stateStore, state, store, genDoc)
+			h := NewHandshaker(logger, stateStore, state, store, eventbus.NopEventBus{}, genDoc)
 			if err = h.Handshake(proxyApp); err != nil {
 				t.Log(err)
 			}
@@ -1245,17 +1256,17 @@ func TestHandshakeUpdatesValidators(t *testing.T) {
 	oldValAddr := state.Validators.Validators[0].Address
 
 	// now start the app using the handshake - it should sync
-	genDoc, _ := sm.MakeGenesisDocFromFile(cfg.GenesisFile())
-	handshaker := NewHandshaker(stateStore, state, store, genDoc)
-	proxyApp := proxy.NewAppConns(clientCreator, proxy.NopMetrics())
+	genDoc, err := sm.MakeGenesisDocFromFile(cfg.GenesisFile())
+	require.NoError(t, err)
+
+	logger := log.TestingLogger()
+	handshaker := NewHandshaker(logger, stateStore, state, store, eventbus.NopEventBus{}, genDoc)
+	proxyApp := proxy.NewAppConns(clientCreator, logger, proxy.NopMetrics())
 	if err := proxyApp.Start(); err != nil {
 		t.Fatalf("Error starting proxy app connections: %v", err)
 	}
-	t.Cleanup(func() {
-		if err := proxyApp.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
+	t.Cleanup(func() { require.NoError(t, proxyApp.Stop()) })
+
 	if err := handshaker.Handshake(proxyApp); err != nil {
 		t.Fatalf("Error on abci handshake: %v", err)
 	}

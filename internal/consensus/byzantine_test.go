@@ -14,6 +14,7 @@ import (
 
 	abciclient "github.com/tendermint/tendermint/abci/client"
 	abci "github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/evidence"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	"github.com/tendermint/tendermint/internal/mempool"
@@ -86,20 +87,17 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 
 			// Make State
 			blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyAppConnCon, mempool, evpool, blockStore)
-			cs := NewState(thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool)
-			cs.SetLogger(cs.Logger)
+			cs := NewState(logger, thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool)
 			// set private validator
 			pv := privVals[i]
 			cs.SetPrivValidator(pv)
 
-			eventBus := types.NewEventBus()
-			eventBus.SetLogger(log.TestingLogger().With("module", "events"))
+			eventBus := eventbus.NewDefault(log.TestingLogger().With("module", "events"))
 			err = eventBus.Start()
 			require.NoError(t, err)
 			cs.SetEventBus(eventBus)
 
 			cs.SetTimeoutTicker(tickerFunc())
-			cs.SetLogger(logger)
 
 			states[i] = cs
 		}()
@@ -238,24 +236,25 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 	// we will check the first six just in case
 	evidenceFromEachValidator := make([]types.Evidence, nValidators)
 
-	wg := new(sync.WaitGroup)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
 	i := 0
 	for _, sub := range rts.subs {
 		wg.Add(1)
 
-		go func(j int, s types.Subscription) {
+		go func(j int, s eventbus.Subscription) {
 			defer wg.Done()
 			for {
-				select {
-				case msg := <-s.Out():
-					require.NotNil(t, msg)
-					block := msg.Data().(types.EventDataNewBlock).Block
-					if len(block.Evidence.Evidence) != 0 {
-						evidenceFromEachValidator[j] = block.Evidence.Evidence[0]
-						return
-					}
-				case <-s.Canceled():
-					require.Fail(t, "subscription failed for %d", j)
+				msg, err := s.Next(ctx)
+				if !assert.NoError(t, err) {
+					cancel()
+					return
+				}
+				require.NotNil(t, msg)
+				block := msg.Data().(types.EventDataNewBlock).Block
+				if len(block.Evidence.Evidence) != 0 {
+					evidenceFromEachValidator[j] = block.Evidence.Evidence[0]
 					return
 				}
 			}

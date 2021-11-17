@@ -16,6 +16,7 @@ import (
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/crypto/encoding"
 	"github.com/tendermint/tendermint/crypto/tmhash"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	mmock "github.com/tendermint/tendermint/internal/mempool/mock"
 	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
@@ -23,6 +24,7 @@ import (
 	sf "github.com/tendermint/tendermint/internal/state/test/factory"
 	"github.com/tendermint/tendermint/internal/store"
 	"github.com/tendermint/tendermint/libs/log"
+	"github.com/tendermint/tendermint/libs/pubsub"
 	tmtime "github.com/tendermint/tendermint/libs/time"
 	"github.com/tendermint/tendermint/types"
 	"github.com/tendermint/tendermint/version"
@@ -36,7 +38,8 @@ var (
 func TestApplyBlock(t *testing.T) {
 	app := &testApp{}
 	cc := abciclient.NewLocalCreator(app)
-	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	logger := log.TestingLogger()
+	proxyApp := proxy.NewAppConns(cc, logger, proxy.NopMetrics())
 	err := proxyApp.Start()
 	require.Nil(t, err)
 	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
@@ -44,7 +47,7 @@ func TestApplyBlock(t *testing.T) {
 	state, stateDB, _ := makeState(1, 1)
 	stateStore := sm.NewStore(stateDB)
 	blockStore := store.NewBlockStore(dbm.NewMemDB())
-	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(),
+	blockExec := sm.NewBlockExecutor(stateStore, logger, proxyApp.Consensus(),
 		mmock.Mempool{}, sm.EmptyEvidencePool{}, blockStore)
 
 	block := sf.MakeBlock(state, 1, new(types.Commit))
@@ -61,7 +64,7 @@ func TestApplyBlock(t *testing.T) {
 func TestBeginBlockValidators(t *testing.T) {
 	app := &testApp{}
 	cc := abciclient.NewLocalCreator(app)
-	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	proxyApp := proxy.NewAppConns(cc, log.TestingLogger(), proxy.NopMetrics())
 	err := proxyApp.Start()
 	require.Nil(t, err)
 	defer proxyApp.Stop() //nolint:errcheck // no need to check error again
@@ -124,7 +127,7 @@ func TestBeginBlockValidators(t *testing.T) {
 func TestBeginBlockByzantineValidators(t *testing.T) {
 	app := &testApp{}
 	cc := abciclient.NewLocalCreator(app)
-	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	proxyApp := proxy.NewAppConns(cc, log.TestingLogger(), proxy.NopMetrics())
 	err := proxyApp.Start()
 	require.Nil(t, err)
 	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
@@ -349,7 +352,8 @@ func TestUpdateValidators(t *testing.T) {
 func TestEndBlockValidatorUpdates(t *testing.T) {
 	app := &testApp{}
 	cc := abciclient.NewLocalCreator(app)
-	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	logger := log.TestingLogger()
+	proxyApp := proxy.NewAppConns(cc, logger, proxy.NopMetrics())
 	err := proxyApp.Start()
 	require.Nil(t, err)
 	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
@@ -360,25 +364,24 @@ func TestEndBlockValidatorUpdates(t *testing.T) {
 
 	blockExec := sm.NewBlockExecutor(
 		stateStore,
-		log.TestingLogger(),
+		logger,
 		proxyApp.Consensus(),
 		mmock.Mempool{},
 		sm.EmptyEvidencePool{},
 		blockStore,
 	)
 
-	eventBus := types.NewEventBus()
+	eventBus := eventbus.NewDefault(logger)
 	err = eventBus.Start()
 	require.NoError(t, err)
 	defer eventBus.Stop() //nolint:errcheck // ignore for tests
 
 	blockExec.SetEventBus(eventBus)
 
-	updatesSub, err := eventBus.Subscribe(
-		context.Background(),
-		"TestEndBlockValidatorUpdates",
-		types.EventQueryValidatorSetUpdates,
-	)
+	updatesSub, err := eventBus.SubscribeWithArgs(context.Background(), pubsub.SubscribeArgs{
+		ClientID: "TestEndBlockValidatorUpdates",
+		Query:    types.EventQueryValidatorSetUpdates,
+	})
 	require.NoError(t, err)
 
 	block := sf.MakeBlock(state, 1, new(types.Commit))
@@ -402,18 +405,15 @@ func TestEndBlockValidatorUpdates(t *testing.T) {
 	}
 
 	// test we threw an event
-	select {
-	case msg := <-updatesSub.Out():
-		event, ok := msg.Data().(types.EventDataValidatorSetUpdates)
-		require.True(t, ok, "Expected event of type EventDataValidatorSetUpdates, got %T", msg.Data())
-		if assert.NotEmpty(t, event.ValidatorUpdates) {
-			assert.Equal(t, pubkey, event.ValidatorUpdates[0].PubKey)
-			assert.EqualValues(t, 10, event.ValidatorUpdates[0].VotingPower)
-		}
-	case <-updatesSub.Canceled():
-		t.Fatalf("updatesSub was canceled (reason: %v)", updatesSub.Err())
-	case <-time.After(1 * time.Second):
-		t.Fatal("Did not receive EventValidatorSetUpdates within 1 sec.")
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	msg, err := updatesSub.Next(ctx)
+	require.NoError(t, err)
+	event, ok := msg.Data().(types.EventDataValidatorSetUpdates)
+	require.True(t, ok, "Expected event of type EventDataValidatorSetUpdates, got %T", msg.Data())
+	if assert.NotEmpty(t, event.ValidatorUpdates) {
+		assert.Equal(t, pubkey, event.ValidatorUpdates[0].PubKey)
+		assert.EqualValues(t, 10, event.ValidatorUpdates[0].VotingPower)
 	}
 }
 
@@ -422,7 +422,8 @@ func TestEndBlockValidatorUpdates(t *testing.T) {
 func TestEndBlockValidatorUpdatesResultingInEmptySet(t *testing.T) {
 	app := &testApp{}
 	cc := abciclient.NewLocalCreator(app)
-	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	logger := log.TestingLogger()
+	proxyApp := proxy.NewAppConns(cc, logger, proxy.NopMetrics())
 	err := proxyApp.Start()
 	require.Nil(t, err)
 	defer proxyApp.Stop() //nolint:errcheck // ignore for tests

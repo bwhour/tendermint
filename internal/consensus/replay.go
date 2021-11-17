@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -11,6 +12,7 @@ import (
 
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/crypto/merkle"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
 	"github.com/tendermint/tendermint/libs/log"
@@ -36,7 +38,7 @@ var crc32c = crc32.MakeTable(crc32.Castagnoli)
 // Unmarshal and apply a single message to the consensus state as if it were
 // received in receiveRoutine.  Lines that start with "#" are ignored.
 // NOTE: receiveRoutine should not be running.
-func (cs *State) readReplayMessage(msg *TimedWALMessage, newStepSub types.Subscription) error {
+func (cs *State) readReplayMessage(msg *TimedWALMessage, newStepSub eventbus.Subscription) error {
 	// Skip meta messages which exist for demarcating boundaries.
 	if _, ok := msg.Msg.(EndHeightMessage); ok {
 		return nil
@@ -47,18 +49,18 @@ func (cs *State) readReplayMessage(msg *TimedWALMessage, newStepSub types.Subscr
 	case types.EventDataRoundState:
 		cs.Logger.Info("Replay: New Step", "height", m.Height, "round", m.Round, "step", m.Step)
 		// these are playback checks
-		ticker := time.After(time.Second * 2)
 		if newStepSub != nil {
-			select {
-			case stepMsg := <-newStepSub.Out():
-				m2 := stepMsg.Data().(types.EventDataRoundState)
-				if m.Height != m2.Height || m.Round != m2.Round || m.Step != m2.Step {
-					return fmt.Errorf("roundState mismatch. Got %v; Expected %v", m2, m)
-				}
-			case <-newStepSub.Canceled():
-				return fmt.Errorf("failed to read off newStepSub.Out(). newStepSub was canceled")
-			case <-ticker:
-				return fmt.Errorf("failed to read off newStepSub.Out()")
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			stepMsg, err := newStepSub.Next(ctx)
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("subscription timed out: %w", err)
+			} else if err != nil {
+				return fmt.Errorf("subscription canceled: %w", err)
+			}
+			m2 := stepMsg.Data().(types.EventDataRoundState)
+			if m.Height != m2.Height || m.Round != m2.Round || m.Step != m2.Step {
+				return fmt.Errorf("roundState mismatch. Got %v; Expected %v", m2, m)
 			}
 		}
 	case msgInfo:
@@ -209,28 +211,24 @@ type Handshaker struct {
 	nBlocks int // number of blocks applied to the state
 }
 
-func NewHandshaker(stateStore sm.Store, state sm.State,
-	store sm.BlockStore, genDoc *types.GenesisDoc) *Handshaker {
+func NewHandshaker(
+	logger log.Logger,
+	stateStore sm.Store,
+	state sm.State,
+	store sm.BlockStore,
+	eventBus types.BlockEventPublisher,
+	genDoc *types.GenesisDoc,
+) *Handshaker {
 
 	return &Handshaker{
 		stateStore:   stateStore,
 		initialState: state,
 		store:        store,
-		eventBus:     types.NopEventBus{},
+		eventBus:     eventBus,
 		genDoc:       genDoc,
-		logger:       log.NewNopLogger(),
+		logger:       logger,
 		nBlocks:      0,
 	}
-}
-
-func (h *Handshaker) SetLogger(l log.Logger) {
-	h.logger = l
-}
-
-// SetEventBus - sets the event bus for publishing block related events.
-// If not called, it defaults to types.NopEventBus.
-func (h *Handshaker) SetEventBus(eventBus types.BlockEventPublisher) {
-	h.eventBus = eventBus
 }
 
 // NBlocks returns the number of blocks applied to the state.
@@ -423,7 +421,7 @@ func (h *Handshaker) ReplayBlocks(
 			if err != nil {
 				return nil, err
 			}
-			mockApp := newMockProxyApp(appHash, abciResponses)
+			mockApp := newMockProxyApp(h.logger, appHash, abciResponses)
 			h.logger.Info("Replay last block using mock app")
 			state, err = h.replayBlock(state, storeBlockHeight, mockApp)
 			return state.AppHash, err

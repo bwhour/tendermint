@@ -14,6 +14,7 @@ import (
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/internal/blocksync"
 	"github.com/tendermint/tendermint/internal/consensus"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/evidence"
 	"github.com/tendermint/tendermint/internal/mempool"
 	"github.com/tendermint/tendermint/internal/p2p"
@@ -89,17 +90,17 @@ func initDBs(
 
 // nolint:lll
 func createAndStartProxyAppConns(clientCreator abciclient.Creator, logger log.Logger, metrics *proxy.Metrics) (proxy.AppConns, error) {
-	proxyApp := proxy.NewAppConns(clientCreator, metrics)
-	proxyApp.SetLogger(logger.With("module", "proxy"))
+	proxyApp := proxy.NewAppConns(clientCreator, logger.With("module", "proxy"), metrics)
+
 	if err := proxyApp.Start(); err != nil {
 		return nil, fmt.Errorf("error starting proxy app connections: %v", err)
 	}
+
 	return proxyApp, nil
 }
 
-func createAndStartEventBus(logger log.Logger) (*types.EventBus, error) {
-	eventBus := types.NewEventBus()
-	eventBus.SetLogger(logger.With("module", "events"))
+func createAndStartEventBus(logger log.Logger) (*eventbus.EventBus, error) {
+	eventBus := eventbus.NewDefault(logger.With("module", "events"))
 	if err := eventBus.Start(); err != nil {
 		return nil, err
 	}
@@ -109,17 +110,22 @@ func createAndStartEventBus(logger log.Logger) (*types.EventBus, error) {
 func createAndStartIndexerService(
 	cfg *config.Config,
 	dbProvider config.DBProvider,
-	eventBus *types.EventBus,
+	eventBus *eventbus.EventBus,
 	logger log.Logger,
 	chainID string,
+	metrics *indexer.Metrics,
 ) (*indexer.Service, []indexer.EventSink, error) {
 	eventSinks, err := sink.EventSinksFromConfig(cfg, dbProvider, chainID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	indexerService := indexer.NewIndexerService(eventSinks, eventBus)
-	indexerService.SetLogger(logger.With("module", "txindex"))
+	indexerService := indexer.NewService(indexer.ServiceArgs{
+		Sinks:    eventSinks,
+		EventBus: eventBus,
+		Logger:   logger.With("module", "txindex"),
+		Metrics:  metrics,
+	})
 
 	if err := indexerService.Start(); err != nil {
 		return nil, nil, err
@@ -128,25 +134,7 @@ func createAndStartIndexerService(
 	return indexerService, eventSinks, nil
 }
 
-func doHandshake(
-	stateStore sm.Store,
-	state sm.State,
-	blockStore sm.BlockStore,
-	genDoc *types.GenesisDoc,
-	eventBus types.BlockEventPublisher,
-	proxyApp proxy.AppConns,
-	consensusLogger log.Logger) error {
-
-	handshaker := consensus.NewHandshaker(stateStore, state, blockStore, genDoc)
-	handshaker.SetLogger(consensusLogger)
-	handshaker.SetEventBus(eventBus)
-	if err := handshaker.Handshake(proxyApp); err != nil {
-		return fmt.Errorf("error during handshake: %v", err)
-	}
-	return nil
-}
-
-func logNodeStartupInfo(state sm.State, pubKey crypto.PubKey, logger, consensusLogger log.Logger, mode string) {
+func logNodeStartupInfo(state sm.State, pubKey crypto.PubKey, logger log.Logger, mode string) {
 	// Log the version info.
 	logger.Info("Version info",
 		"tmVersion", version.TMVersion,
@@ -162,17 +150,23 @@ func logNodeStartupInfo(state sm.State, pubKey crypto.PubKey, logger, consensusL
 			"state", state.Version.Consensus.Block,
 		)
 	}
-	switch {
-	case mode == config.ModeFull:
-		consensusLogger.Info("This node is a fullnode")
-	case mode == config.ModeValidator:
+
+	switch mode {
+	case config.ModeFull:
+		logger.Info("This node is a fullnode")
+	case config.ModeValidator:
 		addr := pubKey.Address()
 		// Log whether this node is a validator or an observer
 		if state.Validators.HasAddress(addr) {
-			consensusLogger.Info("This node is a validator", "addr", addr, "pubKey", pubKey.Bytes())
+			logger.Info("This node is a validator",
+				"addr", addr,
+				"pubKey", pubKey.Bytes(),
+			)
 		} else {
-			consensusLogger.Info("This node is a validator (NOT in the active validator set)",
-				"addr", addr, "pubKey", pubKey.Bytes())
+			logger.Info("This node is a validator (NOT in the active validator set)",
+				"addr", addr,
+				"pubKey", pubKey.Bytes(),
+			)
 		}
 	}
 }
@@ -307,13 +301,15 @@ func createConsensusReactor(
 	privValidator types.PrivValidator,
 	csMetrics *consensus.Metrics,
 	waitSync bool,
-	eventBus *types.EventBus,
+	eventBus *eventbus.EventBus,
 	peerManager *p2p.PeerManager,
 	router *p2p.Router,
 	logger log.Logger,
 ) (*consensus.Reactor, *consensus.State, error) {
+	logger = logger.With("module", "consensus")
 
 	consensusState := consensus.NewState(
+		logger,
 		cfg.Consensus,
 		state.Copy(),
 		blockExec,
@@ -322,7 +318,7 @@ func createConsensusReactor(
 		evidencePool,
 		consensus.StateMetrics(csMetrics),
 	)
-	consensusState.SetLogger(logger)
+
 	if privValidator != nil && cfg.Mode == config.ModeValidator {
 		consensusState.SetPrivValidator(privValidator)
 	}
@@ -339,8 +335,6 @@ func createConsensusReactor(
 		channels[ch.ID] = ch
 	}
 
-	peerUpdates := peerManager.Subscribe()
-
 	reactor := consensus.NewReactor(
 		logger,
 		consensusState,
@@ -348,7 +342,7 @@ func createConsensusReactor(
 		channels[consensus.DataChannel],
 		channels[consensus.VoteChannel],
 		channels[consensus.VoteSetBitsChannel],
-		peerUpdates,
+		peerManager.Subscribe(),
 		waitSync,
 		consensus.ReactorMetrics(csMetrics),
 	)
@@ -381,6 +375,11 @@ func createPeerManager(
 	nodeID types.NodeID,
 ) (*p2p.PeerManager, closer, error) {
 
+	privatePeerIDs := make(map[types.NodeID]struct{})
+	for _, id := range tmstrings.SplitAndTrimEmpty(cfg.P2P.PrivatePeerIDs, ",", " ") {
+		privatePeerIDs[types.NodeID(id)] = struct{}{}
+	}
+
 	var maxConns uint16
 
 	switch {
@@ -388,11 +387,6 @@ func createPeerManager(
 		maxConns = cfg.P2P.MaxConnections
 	default:
 		maxConns = 64
-	}
-
-	privatePeerIDs := make(map[types.NodeID]struct{})
-	for _, id := range tmstrings.SplitAndTrimEmpty(cfg.P2P.PrivatePeerIDs, ",", " ") {
-		privatePeerIDs[types.NodeID(id)] = struct{}{}
 	}
 
 	options := p2p.PeerManagerOptions{
@@ -485,8 +479,7 @@ func createPEXReactor(
 		return nil, err
 	}
 
-	peerUpdates := peerManager.Subscribe()
-	return pex.NewReactor(logger, peerManager, channel, peerUpdates), nil
+	return pex.NewReactor(logger, peerManager, channel, peerManager.Subscribe()), nil
 }
 
 func makeNodeInfo(

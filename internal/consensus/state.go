@@ -15,6 +15,7 @@ import (
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/crypto"
 	cstypes "github.com/tendermint/tendermint/internal/consensus/types"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/libs/fail"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	sm "github.com/tendermint/tendermint/internal/state"
@@ -117,7 +118,7 @@ type State struct {
 
 	// we use eventBus to trigger msg broadcasts in the reactor,
 	// and to notify external subscribers, eg. through a websocket
-	eventBus *types.EventBus
+	eventBus *eventbus.EventBus
 
 	// a Write-Ahead Log ensures we can recover from any kind of crash
 	// and helps us avoid signing conflicting votes
@@ -152,6 +153,7 @@ type StateOption func(*State)
 
 // NewState returns a new State.
 func NewState(
+	logger log.Logger,
 	cfg *config.ConsensusConfig,
 	state sm.State,
 	blockExec *sm.BlockExecutor,
@@ -167,7 +169,7 @@ func NewState(
 		txNotifier:       txNotifier,
 		peerMsgQueue:     make(chan msgInfo, msgQueueSize),
 		internalMsgQueue: make(chan msgInfo, msgQueueSize),
-		timeoutTicker:    NewTimeoutTicker(),
+		timeoutTicker:    NewTimeoutTicker(logger),
 		statsMsgQueue:    make(chan msgInfo, msgQueueSize),
 		done:             make(chan struct{}),
 		doWALCatchup:     true,
@@ -192,7 +194,7 @@ func NewState(
 
 	// NOTE: we do not call scheduleRound0 yet, we do that upon Start()
 
-	cs.BaseService = *service.NewBaseService(nil, "State", cs)
+	cs.BaseService = *service.NewBaseService(logger, "State", cs)
 	for _, option := range options {
 		option(cs)
 	}
@@ -200,14 +202,8 @@ func NewState(
 	return cs
 }
 
-// SetLogger implements Service.
-func (cs *State) SetLogger(l log.Logger) {
-	cs.BaseService.Logger = l
-	cs.timeoutTicker.SetLogger(l)
-}
-
 // SetEventBus sets event bus.
-func (cs *State) SetEventBus(b *types.EventBus) {
+func (cs *State) SetEventBus(b *eventbus.EventBus) {
 	cs.eventBus = b
 	cs.blockExec.SetEventBus(b)
 }
@@ -480,13 +476,11 @@ func (cs *State) Wait() {
 // OpenWAL opens a file to log all consensus messages and timeouts for
 // deterministic accountability.
 func (cs *State) OpenWAL(walFile string) (WAL, error) {
-	wal, err := NewWAL(walFile)
+	wal, err := NewWAL(cs.Logger.With("wal", walFile), walFile)
 	if err != nil {
 		cs.Logger.Error("failed to open WAL", "file", walFile, "err", err)
 		return nil, err
 	}
-
-	wal.SetLogger(cs.Logger.With("wal", walFile))
 
 	if err := wal.Start(); err != nil {
 		cs.Logger.Error("failed to start WAL", "err", err)

@@ -16,6 +16,7 @@ import (
 	abciclient "github.com/tendermint/tendermint/abci/client"
 	"github.com/tendermint/tendermint/abci/example/kvstore"
 	"github.com/tendermint/tendermint/config"
+	"github.com/tendermint/tendermint/internal/eventbus"
 	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
 	"github.com/tendermint/tendermint/internal/store"
@@ -65,8 +66,7 @@ func WALGenerateNBlocks(t *testing.T, wr io.Writer, numBlocks int) (err error) {
 
 	blockStore := store.NewBlockStore(blockStoreDB)
 
-	proxyApp := proxy.NewAppConns(abciclient.NewLocalCreator(app), proxy.NopMetrics())
-	proxyApp.SetLogger(logger.With("module", "proxy"))
+	proxyApp := proxy.NewAppConns(abciclient.NewLocalCreator(app), logger.With("module", "proxy"), proxy.NopMetrics())
 	if err := proxyApp.Start(); err != nil {
 		return fmt.Errorf("failed to start proxy app connections: %w", err)
 	}
@@ -76,8 +76,7 @@ func WALGenerateNBlocks(t *testing.T, wr io.Writer, numBlocks int) (err error) {
 		}
 	})
 
-	eventBus := types.NewEventBus()
-	eventBus.SetLogger(logger.With("module", "events"))
+	eventBus := eventbus.NewDefault(logger.With("module", "events"))
 	if err := eventBus.Start(); err != nil {
 		return fmt.Errorf("failed to start event bus: %w", err)
 	}
@@ -89,8 +88,7 @@ func WALGenerateNBlocks(t *testing.T, wr io.Writer, numBlocks int) (err error) {
 	mempool := emptyMempool{}
 	evpool := sm.EmptyEvidencePool{}
 	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(), mempool, evpool, blockStore)
-	consensusState := NewState(cfg.Consensus, state.Copy(), blockExec, blockStore, mempool, evpool)
-	consensusState.SetLogger(logger)
+	consensusState := NewState(logger, cfg.Consensus, state.Copy(), blockExec, blockStore, mempool, evpool)
 	consensusState.SetEventBus(eventBus)
 	if privValidator != nil && privValidator != (*privval.FilePV)(nil) {
 		consensusState.SetPrivValidator(privValidator)

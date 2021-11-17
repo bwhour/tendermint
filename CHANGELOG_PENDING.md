@@ -23,12 +23,17 @@ Special thanks to external contributors on this release:
 - P2P Protocol
 
   - [p2p] \#7035 Remove legacy P2P routing implementation and associated configuration options. (@tychoish)
+  - [p2p] \#7265 Peer manager reduces peer score for each failed dial attempts for peers that have not successfully dialed. (@tychoish)
 
 - Go API
 
+  - [pubsub] \#7231 Remove unbuffered subscriptions and rework the Subscription interface. (@creachadair)
+  - [eventbus] \#7231 Move the EventBus type to the internal/eventbus package. (@creachadair)
   - [blocksync] \#7046 Remove v2 implementation of the blocksync service and recactor, which was disabled in the previous release. (@tychoish)
   - [p2p] \#7064 Remove WDRR queue implementation. (@tychoish)
   - [config] \#7169 `WriteConfigFile` now returns an error. (@tychoish)
+  - [libs/service] \#7288 Remove SetLogger method on `service.Service` interface. (@tychosih)
+
 
 - Blockchain Protocol
 
