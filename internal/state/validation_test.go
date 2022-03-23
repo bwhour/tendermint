@@ -10,10 +10,13 @@ import (
 	"github.com/stretchr/testify/require"
 	dbm "github.com/tendermint/tm-db"
 
+	abciclient "github.com/tendermint/tendermint/abci/client"
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/crypto/tmhash"
-	memmock "github.com/tendermint/tendermint/internal/mempool/mock"
+	"github.com/tendermint/tendermint/internal/eventbus"
+	mpmocks "github.com/tendermint/tendermint/internal/mempool/mocks"
+	"github.com/tendermint/tendermint/internal/proxy"
 	sm "github.com/tendermint/tendermint/internal/state"
 	"github.com/tendermint/tendermint/internal/state/mocks"
 	statefactory "github.com/tendermint/tendermint/internal/state/test/factory"
@@ -28,20 +31,38 @@ import (
 const validationTestsStopHeight int64 = 10
 
 func TestValidateBlockHeader(t *testing.T) {
-	proxyApp := newTestApp()
-	require.NoError(t, proxyApp.Start())
-	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := log.NewNopLogger()
+	proxyApp := proxy.New(abciclient.NewLocalClient(logger, &testApp{}), logger, proxy.NopMetrics())
+	require.NoError(t, proxyApp.Start(ctx))
 
-	state, stateDB, privVals := makeState(3, 1)
+	eventBus := eventbus.NewDefault(logger)
+	require.NoError(t, eventBus.Start(ctx))
+
+	state, stateDB, privVals := makeState(t, 3, 1)
 	stateStore := sm.NewStore(stateDB)
+	mp := &mpmocks.Mempool{}
+	mp.On("Lock").Return()
+	mp.On("Unlock").Return()
+	mp.On("FlushAppConn", mock.Anything).Return(nil)
+	mp.On("Update",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything).Return(nil)
+
 	blockStore := store.NewBlockStore(dbm.NewMemDB())
 	blockExec := sm.NewBlockExecutor(
 		stateStore,
-		log.TestingLogger(),
-		proxyApp.Consensus(),
-		memmock.Mempool{},
+		logger,
+		proxyApp,
+		mp,
 		sm.EmptyEvidencePool{},
 		blockStore,
+		eventBus,
 	)
 	lastCommit := types.NewCommit(0, 0, types.BlockID{}, nil)
 
@@ -62,7 +83,6 @@ func TestValidateBlockHeader(t *testing.T) {
 		{"ChainID wrong", func(block *types.Block) { block.ChainID = "not-the-real-one" }},
 		{"Height wrong", func(block *types.Block) { block.Height += 10 }},
 		{"Time wrong", func(block *types.Block) { block.Time = block.Time.Add(-time.Second * 1) }},
-		{"Time wrong 2", func(block *types.Block) { block.Time = block.Time.Add(time.Second * 1) }},
 
 		{"LastBlockID wrong", func(block *types.Block) { block.LastBlockID.PartSetHeader.Total += 10 }},
 		{"LastCommitHash wrong", func(block *types.Block) { block.LastCommitHash = wrongHash }},
@@ -92,7 +112,7 @@ func TestValidateBlockHeader(t *testing.T) {
 		for _, tc := range testCases {
 			block := statefactory.MakeBlock(state, height, lastCommit)
 			tc.malleateBlock(block)
-			err := blockExec.ValidateBlock(state, block)
+			err := blockExec.ValidateBlock(ctx, state, block)
 			t.Logf("%s: %v", tc.name, err)
 			require.Error(t, err, tc.name)
 		}
@@ -100,35 +120,52 @@ func TestValidateBlockHeader(t *testing.T) {
 		/*
 			A good block passes
 		*/
-		var err error
-		state, _, lastCommit, err = makeAndCommitGoodBlock(
+		state, _, lastCommit = makeAndCommitGoodBlock(ctx, t,
 			state, height, lastCommit, state.Validators.GetProposer().Address, blockExec, privVals, nil)
-		require.NoError(t, err, "height %d", height)
 	}
 
 	nextHeight := validationTestsStopHeight
 	block := statefactory.MakeBlock(state, nextHeight, lastCommit)
 	state.InitialHeight = nextHeight + 1
-	err := blockExec.ValidateBlock(state, block)
+	err := blockExec.ValidateBlock(ctx, state, block)
 	require.Error(t, err, "expected an error when state is ahead of block")
 	assert.Contains(t, err.Error(), "lower than initial height")
 }
 
 func TestValidateBlockCommit(t *testing.T) {
-	proxyApp := newTestApp()
-	require.NoError(t, proxyApp.Start())
-	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	state, stateDB, privVals := makeState(1, 1)
+	logger := log.NewNopLogger()
+	proxyApp := proxy.New(abciclient.NewLocalClient(logger, &testApp{}), logger, proxy.NopMetrics())
+	require.NoError(t, proxyApp.Start(ctx))
+
+	eventBus := eventbus.NewDefault(logger)
+	require.NoError(t, eventBus.Start(ctx))
+
+	state, stateDB, privVals := makeState(t, 1, 1)
 	stateStore := sm.NewStore(stateDB)
+	mp := &mpmocks.Mempool{}
+	mp.On("Lock").Return()
+	mp.On("Unlock").Return()
+	mp.On("FlushAppConn", mock.Anything).Return(nil)
+	mp.On("Update",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything).Return(nil)
+
 	blockStore := store.NewBlockStore(dbm.NewMemDB())
 	blockExec := sm.NewBlockExecutor(
 		stateStore,
-		log.TestingLogger(),
-		proxyApp.Consensus(),
-		memmock.Mempool{},
+		logger,
+		proxyApp,
+		mp,
 		sm.EmptyEvidencePool{},
 		blockStore,
+		eventBus,
 	)
 	lastCommit := types.NewCommit(0, 0, types.BlockID{}, nil)
 	wrongSigsCommit := types.NewCommit(1, 0, types.BlockID{}, nil)
@@ -142,6 +179,7 @@ func TestValidateBlockCommit(t *testing.T) {
 			*/
 			// should be height-1 instead of height
 			wrongHeightVote, err := testfactory.MakeVote(
+				ctx,
 				privVals[proposerAddr.String()],
 				chainID,
 				1,
@@ -151,7 +189,7 @@ func TestValidateBlockCommit(t *testing.T) {
 				state.LastBlockID,
 				time.Now(),
 			)
-			require.NoError(t, err, "height %d", height)
+			require.NoError(t, err)
 			wrongHeightCommit := types.NewCommit(
 				wrongHeightVote.Height,
 				wrongHeightVote.Round,
@@ -159,7 +197,7 @@ func TestValidateBlockCommit(t *testing.T) {
 				[]types.CommitSig{wrongHeightVote.CommitSig()},
 			)
 			block := statefactory.MakeBlock(state, height, wrongHeightCommit)
-			err = blockExec.ValidateBlock(state, block)
+			err = blockExec.ValidateBlock(ctx, state, block)
 			_, isErrInvalidCommitHeight := err.(types.ErrInvalidCommitHeight)
 			require.True(t, isErrInvalidCommitHeight, "expected ErrInvalidCommitHeight at height %d but got: %v", height, err)
 
@@ -167,7 +205,7 @@ func TestValidateBlockCommit(t *testing.T) {
 				#2589: test len(block.LastCommit.Signatures) == state.LastValidators.Size()
 			*/
 			block = statefactory.MakeBlock(state, height, wrongSigsCommit)
-			err = blockExec.ValidateBlock(state, block)
+			err = blockExec.ValidateBlock(ctx, state, block)
 			_, isErrInvalidCommitSignatures := err.(types.ErrInvalidCommitSignatures)
 			require.True(t, isErrInvalidCommitSignatures,
 				"expected ErrInvalidCommitSignatures at height %d, but got: %v",
@@ -179,9 +217,10 @@ func TestValidateBlockCommit(t *testing.T) {
 		/*
 			A good block passes
 		*/
-		var err error
 		var blockID types.BlockID
-		state, blockID, lastCommit, err = makeAndCommitGoodBlock(
+		state, blockID, lastCommit = makeAndCommitGoodBlock(
+			ctx,
+			t,
 			state,
 			height,
 			lastCommit,
@@ -190,12 +229,12 @@ func TestValidateBlockCommit(t *testing.T) {
 			privVals,
 			nil,
 		)
-		require.NoError(t, err, "height %d", height)
 
 		/*
 			wrongSigsCommit is fine except for the extra bad precommit
 		*/
 		goodVote, err := testfactory.MakeVote(
+			ctx,
 			privVals[proposerAddr.String()],
 			chainID,
 			1,
@@ -205,9 +244,8 @@ func TestValidateBlockCommit(t *testing.T) {
 			blockID,
 			time.Now(),
 		)
-		require.NoError(t, err, "height %d", height)
-
-		bpvPubKey, err := badPrivVal.GetPubKey(context.Background())
+		require.NoError(t, err)
+		bpvPubKey, err := badPrivVal.GetPubKey(ctx)
 		require.NoError(t, err)
 
 		badVote := &types.Vote{
@@ -223,9 +261,9 @@ func TestValidateBlockCommit(t *testing.T) {
 		g := goodVote.ToProto()
 		b := badVote.ToProto()
 
-		err = badPrivVal.SignVote(context.Background(), chainID, g)
+		err = badPrivVal.SignVote(ctx, chainID, g)
 		require.NoError(t, err, "height %d", height)
-		err = badPrivVal.SignVote(context.Background(), chainID, b)
+		err = badPrivVal.SignVote(ctx, chainID, b)
 		require.NoError(t, err, "height %d", height)
 
 		goodVote.Signature, badVote.Signature = g.Signature, b.Signature
@@ -236,29 +274,47 @@ func TestValidateBlockCommit(t *testing.T) {
 }
 
 func TestValidateBlockEvidence(t *testing.T) {
-	proxyApp := newTestApp()
-	require.NoError(t, proxyApp.Start())
-	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	state, stateDB, privVals := makeState(4, 1)
+	logger := log.NewNopLogger()
+	proxyApp := proxy.New(abciclient.NewLocalClient(logger, &testApp{}), logger, proxy.NopMetrics())
+	require.NoError(t, proxyApp.Start(ctx))
+
+	state, stateDB, privVals := makeState(t, 4, 1)
 	stateStore := sm.NewStore(stateDB)
 	blockStore := store.NewBlockStore(dbm.NewMemDB())
 	defaultEvidenceTime := time.Date(2019, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	evpool := &mocks.EvidencePool{}
-	evpool.On("CheckEvidence", mock.AnythingOfType("types.EvidenceList")).Return(nil)
-	evpool.On("Update", mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
+	evpool.On("CheckEvidence", ctx, mock.AnythingOfType("types.EvidenceList")).Return(nil)
+	evpool.On("Update", ctx, mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
 	evpool.On("ABCIEvidence", mock.AnythingOfType("int64"), mock.AnythingOfType("[]types.Evidence")).Return(
 		[]abci.Evidence{})
+
+	eventBus := eventbus.NewDefault(logger)
+	require.NoError(t, eventBus.Start(ctx))
+	mp := &mpmocks.Mempool{}
+	mp.On("Lock").Return()
+	mp.On("Unlock").Return()
+	mp.On("FlushAppConn", mock.Anything).Return(nil)
+	mp.On("Update",
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything,
+		mock.Anything).Return(nil)
 
 	state.ConsensusParams.Evidence.MaxBytes = 1000
 	blockExec := sm.NewBlockExecutor(
 		stateStore,
-		log.TestingLogger(),
-		proxyApp.Consensus(),
-		memmock.Mempool{},
+		log.NewNopLogger(),
+		proxyApp,
+		mp,
 		evpool,
 		blockStore,
+		eventBus,
 	)
 	lastCommit := types.NewCommit(0, 0, types.BlockID{}, nil)
 
@@ -273,13 +329,15 @@ func TestValidateBlockEvidence(t *testing.T) {
 			var currentBytes int64
 			// more bytes than the maximum allowed for evidence
 			for currentBytes <= maxBytesEvidence {
-				newEv := types.NewMockDuplicateVoteEvidenceWithValidator(height, time.Now(),
+				newEv, err := types.NewMockDuplicateVoteEvidenceWithValidator(ctx, height, time.Now(),
 					privVals[proposerAddr.String()], chainID)
+				require.NoError(t, err)
 				evidence = append(evidence, newEv)
 				currentBytes += int64(len(newEv.Bytes()))
 			}
-			block, _ := state.MakeBlock(height, testfactory.MakeTenTxs(height), lastCommit, evidence, proposerAddr)
-			err := blockExec.ValidateBlock(state, block)
+			block := state.MakeBlock(height, testfactory.MakeTenTxs(height), lastCommit, evidence, proposerAddr)
+
+			err := blockExec.ValidateBlock(ctx, state, block)
 			if assert.Error(t, err) {
 				_, ok := err.(*types.ErrEvidenceOverflow)
 				require.True(t, ok, "expected error to be of type ErrEvidenceOverflow at height %d but got %v", height, err)
@@ -293,8 +351,9 @@ func TestValidateBlockEvidence(t *testing.T) {
 		var currentBytes int64
 		// precisely the amount of allowed evidence
 		for {
-			newEv := types.NewMockDuplicateVoteEvidenceWithValidator(height, defaultEvidenceTime,
+			newEv, err := types.NewMockDuplicateVoteEvidenceWithValidator(ctx, height, defaultEvidenceTime,
 				privVals[proposerAddr.String()], chainID)
+			require.NoError(t, err)
 			currentBytes += int64(len(newEv.Bytes()))
 			if currentBytes >= maxBytesEvidence {
 				break
@@ -302,8 +361,9 @@ func TestValidateBlockEvidence(t *testing.T) {
 			evidence = append(evidence, newEv)
 		}
 
-		var err error
-		state, _, lastCommit, err = makeAndCommitGoodBlock(
+		state, _, lastCommit = makeAndCommitGoodBlock(
+			ctx,
+			t,
 			state,
 			height,
 			lastCommit,
@@ -312,6 +372,6 @@ func TestValidateBlockEvidence(t *testing.T) {
 			privVals,
 			evidence,
 		)
-		require.NoError(t, err, "height %d", height)
+
 	}
 }

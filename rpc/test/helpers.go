@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"testing"
 	"time"
 
 	abciclient "github.com/tendermint/tendermint/abci/client"
@@ -32,7 +33,7 @@ func waitForRPC(ctx context.Context, conf *config.Config) {
 	}
 	result := new(coretypes.ResultStatus)
 	for {
-		_, err := client.Call(ctx, "status", map[string]interface{}{}, result)
+		err := client.Call(ctx, "status", map[string]interface{}{}, result)
 		if err == nil {
 			return
 		}
@@ -57,8 +58,8 @@ func makeAddrs() (p2pAddr, rpcAddr string) {
 	return fmt.Sprintf(addrTemplate, randPort()), fmt.Sprintf(addrTemplate, randPort())
 }
 
-func CreateConfig(testName string) (*config.Config, error) {
-	c, err := config.ResetTestRoot(testName)
+func CreateConfig(t *testing.T, testName string) (*config.Config, error) {
+	c, err := config.ResetTestRoot(t.TempDir(), testName)
 	if err != nil {
 		return nil, err
 	}
@@ -66,6 +67,7 @@ func CreateConfig(testName string) (*config.Config, error) {
 	p2pAddr, rpcAddr := makeAddrs()
 	c.P2P.ListenAddress = p2pAddr
 	c.RPC.ListenAddress = rpcAddr
+	c.RPC.EventLogWindowSize = 5 * time.Minute
 	c.Consensus.WalPath = "rpc-test"
 	c.RPC.CORSAllowedOrigins = []string{"https://tendermint.com/"}
 	return c, nil
@@ -73,10 +75,13 @@ func CreateConfig(testName string) (*config.Config, error) {
 
 type ServiceCloser func(context.Context) error
 
-func StartTendermint(ctx context.Context,
+func StartTendermint(
+	ctx context.Context,
 	conf *config.Config,
 	app abci.Application,
-	opts ...func(*Options)) (service.Service, ServiceCloser, error) {
+	opts ...func(*Options),
+) (service.Service, ServiceCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
 
 	nodeOpts := &Options{}
 	for _, opt := range opts {
@@ -86,17 +91,22 @@ func StartTendermint(ctx context.Context,
 	if nodeOpts.suppressStdout {
 		logger = log.NewNopLogger()
 	} else {
-		logger = log.MustNewDefaultLogger(log.LogFormatPlain, log.LogLevelInfo, false)
+		var err error
+		logger, err = log.NewDefaultLogger(log.LogFormatPlain, log.LogLevelInfo)
+		if err != nil {
+			return nil, func(_ context.Context) error { cancel(); return nil }, err
+		}
+
 	}
-	papp := abciclient.NewLocalCreator(app)
-	tmNode, err := node.New(conf, logger, papp, nil)
+	papp := abciclient.NewLocalClient(logger, app)
+	tmNode, err := node.New(ctx, conf, logger, papp, nil)
 	if err != nil {
-		return nil, func(_ context.Context) error { return nil }, err
+		return nil, func(_ context.Context) error { cancel(); return nil }, err
 	}
 
-	err = tmNode.Start()
+	err = tmNode.Start(ctx)
 	if err != nil {
-		return nil, func(_ context.Context) error { return nil }, err
+		return nil, func(_ context.Context) error { cancel(); return nil }, err
 	}
 
 	waitForRPC(ctx, conf)
@@ -106,9 +116,7 @@ func StartTendermint(ctx context.Context,
 	}
 
 	return tmNode, func(ctx context.Context) error {
-		if err := tmNode.Stop(); err != nil {
-			logger.Error("Error when trying to stop node", "err", err)
-		}
+		cancel()
 		tmNode.Wait()
 		os.RemoveAll(conf.RootDir)
 		return nil

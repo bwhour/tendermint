@@ -594,7 +594,7 @@ This section will cover settings within the p2p section of the `config.toml`.
 - `pex` = turns the peer exchange reactor on or off. Validator node will want the `pex` turned off so it would not begin gossiping to unknown peers on the network. PeX can also be turned off for statically configured networks with fixed network connectivity. For full nodes on open, dynamic networks, it should be turned on.
 - `private-peer-ids` = is a comma-separated list of node ids that will _not_ be exposed to other peers (i.e., you will not tell other peers about the ids in this list). This can be filled with a validator's node id.
 
-Recently the Tendermint Team conducted a refactor of the p2p layer. This lead to multiple config paramters being deprecated and/or replaced. 
+Recently the Tendermint Team conducted a refactor of the p2p layer. This lead to multiple config parameters being deprecated and/or replaced. 
 
 We will cover the new and deprecated parameters below.
 ### New Parameters
@@ -606,7 +606,7 @@ There are three new parameters, which are enabled if use-legacy is set to false.
 - `max-connections` = is the max amount of allowed inbound and outbound connections.
 ### Deprecated Parameters
 
-> Note: For Tendermint 0.35, there are two p2p implementations. The old version is used by deafult with the deprecated fields. The new implementation uses different config parameters, explained above.
+> Note: For Tendermint 0.35, there are two p2p implementations. The old version is used by default with the deprecated fields. The new implementation uses different config parameters, explained above.
 
 - `max-num-inbound-peers` = is the maximum number of peers you will accept inbound connections from at one time (where they dial your address and initiate the connection). *This was replaced by `max-connections`*
 - `max-num-outbound-peers` = is the maximum number of peers you will initiate outbound connects to at one time (where you dial their address and initiate the connection).*This was replaced by `max-connections`*

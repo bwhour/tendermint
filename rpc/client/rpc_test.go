@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -20,7 +21,7 @@ import (
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/crypto/encoding"
 	"github.com/tendermint/tendermint/internal/mempool"
-	tmjson "github.com/tendermint/tendermint/libs/json"
+	rpccore "github.com/tendermint/tendermint/internal/rpc/core"
 	"github.com/tendermint/tendermint/libs/log"
 	tmmath "github.com/tendermint/tendermint/libs/math"
 	"github.com/tendermint/tendermint/libs/service"
@@ -33,38 +34,39 @@ import (
 	"github.com/tendermint/tendermint/types"
 )
 
-func getHTTPClient(t *testing.T, conf *config.Config) *rpchttp.HTTP {
+func getHTTPClient(t *testing.T, logger log.Logger, conf *config.Config) *rpchttp.HTTP {
 	t.Helper()
 
 	rpcAddr := conf.RPC.ListenAddress
 	c, err := rpchttp.NewWithClient(rpcAddr, http.DefaultClient)
 	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, c.Start(ctx))
 
-	c.SetLogger(log.TestingLogger())
+	c.Logger = logger
 	t.Cleanup(func() {
-		if c.IsRunning() {
-			require.NoError(t, c.Stop())
-		}
+		cancel()
+		require.NoError(t, c.Stop())
 	})
 
 	return c
 }
 
-func getHTTPClientWithTimeout(t *testing.T, conf *config.Config, timeout time.Duration) *rpchttp.HTTP {
+func getHTTPClientWithTimeout(t *testing.T, logger log.Logger, conf *config.Config, timeout time.Duration) *rpchttp.HTTP {
 	t.Helper()
 
 	rpcAddr := conf.RPC.ListenAddress
 
-	http.DefaultClient.Timeout = timeout
-	c, err := rpchttp.NewWithClient(rpcAddr, http.DefaultClient)
+	tclient := &http.Client{Timeout: timeout}
+	c, err := rpchttp.NewWithClient(rpcAddr, tclient)
 	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, c.Start(ctx))
 
-	c.SetLogger(log.TestingLogger())
+	c.Logger = logger
 	t.Cleanup(func() {
-		http.DefaultClient.Timeout = 0
-		if c.IsRunning() {
-			require.NoError(t, c.Stop())
-		}
+		cancel()
+		require.NoError(t, c.Stop())
 	})
 
 	return c
@@ -77,12 +79,13 @@ func GetClients(t *testing.T, ns service.Service, conf *config.Config) []client.
 	node, ok := ns.(rpclocal.NodeService)
 	require.True(t, ok)
 
-	ncl, err := rpclocal.New(node)
+	logger := log.NewTestingLogger(t)
+	ncl, err := rpclocal.New(logger, node)
 	require.NoError(t, err)
 
 	return []client.Client{
 		ncl,
-		getHTTPClient(t, conf),
+		getHTTPClient(t, logger, conf),
 	}
 }
 
@@ -90,7 +93,9 @@ func TestClientOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	_, conf := NodeSuite(t)
+	logger := log.NewTestingLogger(t)
+
+	_, conf := NodeSuite(ctx, t, logger)
 
 	t.Run("NilCustomHTTPClient", func(t *testing.T) {
 		_, err := rpchttp.NewWithClient("http://example.com", nil)
@@ -108,7 +113,7 @@ func TestClientOperations(t *testing.T) {
 	t.Run("CustomHTTPClient", func(t *testing.T) {
 		remote := conf.RPC.ListenAddress
 		c, err := rpchttp.NewWithClient(remote, http.DefaultClient)
-		require.Nil(t, err)
+		require.NoError(t, err)
 		status, err := c.Status(ctx)
 		require.NoError(t, err)
 		require.NotNil(t, status)
@@ -118,24 +123,26 @@ func TestClientOperations(t *testing.T) {
 		remote := strings.ReplaceAll(conf.RPC.ListenAddress, "tcp", "http")
 
 		req, err := http.NewRequestWithContext(ctx, "GET", remote, nil)
-		require.Nil(t, err, "%+v", err)
+		require.NoError(t, err, "%+v", err)
 		req.Header.Set("Origin", origin)
 		resp, err := http.DefaultClient.Do(req)
-		require.Nil(t, err, "%+v", err)
+		require.NoError(t, err, "%+v", err)
 		defer resp.Body.Close()
 
 		assert.Equal(t, resp.Header.Get("Access-Control-Allow-Origin"), origin)
 	})
 	t.Run("Batching", func(t *testing.T) {
 		t.Run("JSONRPCCalls", func(t *testing.T) {
-			c := getHTTPClient(t, conf)
+			logger := log.NewTestingLogger(t)
+			c := getHTTPClient(t, logger, conf)
 			testBatchedJSONRPCCalls(ctx, t, c)
 		})
 		t.Run("JSONRPCCallsCancellation", func(t *testing.T) {
 			_, _, tx1 := MakeTxKV()
 			_, _, tx2 := MakeTxKV()
 
-			c := getHTTPClient(t, conf)
+			logger := log.NewTestingLogger(t)
+			c := getHTTPClient(t, logger, conf)
 			batch := c.NewBatch()
 			_, err := batch.BroadcastTxCommit(ctx, tx1)
 			require.NoError(t, err)
@@ -149,19 +156,25 @@ func TestClientOperations(t *testing.T) {
 			require.Equal(t, 0, batch.Count())
 		})
 		t.Run("SendingEmptyRequest", func(t *testing.T) {
-			c := getHTTPClient(t, conf)
+			logger := log.NewTestingLogger(t)
+
+			c := getHTTPClient(t, logger, conf)
 			batch := c.NewBatch()
 			_, err := batch.Send(ctx)
 			require.Error(t, err, "sending an empty batch of JSON RPC requests should result in an error")
 		})
 		t.Run("ClearingEmptyRequest", func(t *testing.T) {
-			c := getHTTPClient(t, conf)
+			logger := log.NewTestingLogger(t)
+
+			c := getHTTPClient(t, logger, conf)
 			batch := c.NewBatch()
 			require.Zero(t, batch.Clear(), "clearing an empty batch of JSON RPC requests should result in a 0 result")
 		})
 		t.Run("ConcurrentJSONRPC", func(t *testing.T) {
+			logger := log.NewTestingLogger(t)
+
 			var wg sync.WaitGroup
-			c := getHTTPClient(t, conf)
+			c := getHTTPClient(t, logger, conf)
 			for i := 0; i < 50; i++ {
 				wg.Add(1)
 				go func() {
@@ -172,30 +185,15 @@ func TestClientOperations(t *testing.T) {
 			wg.Wait()
 		})
 	})
-	t.Run("HTTPReturnsErrorIfClientIsNotRunning", func(t *testing.T) {
-		c := getHTTPClientWithTimeout(t, conf, 100*time.Millisecond)
-
-		// on Subscribe
-		_, err := c.Subscribe(ctx, "TestHeaderEvents",
-			types.QueryForEvent(types.EventNewBlockHeaderValue).String())
-		assert.Error(t, err)
-
-		// on Unsubscribe
-		err = c.Unsubscribe(ctx, "TestHeaderEvents",
-			types.QueryForEvent(types.EventNewBlockHeaderValue).String())
-		assert.Error(t, err)
-
-		// on UnsubscribeAll
-		err = c.UnsubscribeAll(ctx, "TestHeaderEvents")
-		assert.Error(t, err)
-	})
 }
 
 // Make sure info is correct (we connect properly)
 func TestClientMethodCalls(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	n, conf := NodeSuite(t)
+	logger := log.NewTestingLogger(t)
+
+	n, conf := NodeSuite(ctx, t, logger)
 
 	// for broadcast tx tests
 	pool := getMempool(t, n)
@@ -208,7 +206,7 @@ func TestClientMethodCalls(t *testing.T) {
 		t.Run(fmt.Sprintf("%T", c), func(t *testing.T) {
 			t.Run("Status", func(t *testing.T) {
 				status, err := c.Status(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.Equal(t, conf.Moniker, status.NodeInfo.Moniker)
 			})
 			t.Run("Info", func(t *testing.T) {
@@ -225,7 +223,7 @@ func TestClientMethodCalls(t *testing.T) {
 				nc, ok := c.(client.NetworkClient)
 				require.True(t, ok, "%d", i)
 				netinfo, err := nc.NetInfo(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.True(t, netinfo.Listening)
 				assert.Equal(t, 0, len(netinfo.Peers))
 			})
@@ -234,7 +232,7 @@ func TestClientMethodCalls(t *testing.T) {
 				nc, ok := c.(client.NetworkClient)
 				require.True(t, ok, "%d", i)
 				cons, err := nc.DumpConsensusState(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.NotEmpty(t, cons.RoundState)
 				assert.Empty(t, cons.Peers)
 			})
@@ -243,19 +241,19 @@ func TestClientMethodCalls(t *testing.T) {
 				nc, ok := c.(client.NetworkClient)
 				require.True(t, ok, "%d", i)
 				cons, err := nc.ConsensusState(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.NotEmpty(t, cons.RoundState)
 			})
 			t.Run("Health", func(t *testing.T) {
 				nc, ok := c.(client.NetworkClient)
 				require.True(t, ok, "%d", i)
 				_, err := nc.Health(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 			})
 			t.Run("GenesisAndValidators", func(t *testing.T) {
 				// make sure this is the right genesis file
 				gen, err := c.Genesis(ctx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				// get the genesis validator
 				require.Equal(t, 1, len(gen.Genesis.Validators))
 				gval := gen.Genesis.Validators[0]
@@ -263,7 +261,7 @@ func TestClientMethodCalls(t *testing.T) {
 				// get the current validators
 				h := int64(1)
 				vals, err := c.Validators(ctx, &h, nil, nil)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				require.Equal(t, 1, len(vals.Validators))
 				require.Equal(t, 1, vals.Count)
 				require.Equal(t, 1, vals.Total)
@@ -289,7 +287,7 @@ func TestClientMethodCalls(t *testing.T) {
 				doc := []byte(strings.Join(decoded, ""))
 
 				var out types.GenesisDoc
-				require.NoError(t, tmjson.Unmarshal(doc, &out),
+				require.NoError(t, json.Unmarshal(doc, &out),
 					"first: %+v, doc: %s", first, string(doc))
 			})
 			t.Run("ABCIQuery", func(t *testing.T) {
@@ -302,7 +300,7 @@ func TestClientMethodCalls(t *testing.T) {
 				apph := status.SyncInfo.LatestBlockHeight + 2 // this is where the tx will be applied to the state
 
 				// wait before querying
-				err = client.WaitForHeight(c, apph, nil)
+				err = client.WaitForHeight(ctx, c, apph, nil)
 				require.NoError(t, err)
 				res, err := c.ABCIQuery(ctx, "/key", k)
 				qres := res.Response
@@ -326,12 +324,12 @@ func TestClientMethodCalls(t *testing.T) {
 				k, v, tx := MakeTxKV()
 				bres, err := c.BroadcastTxCommit(ctx, tx)
 				require.NoError(t, err)
-				require.True(t, bres.DeliverTx.IsOK())
+				require.True(t, bres.TxResult.IsOK())
 				txh := bres.Height
 				apph := txh + 1 // this is where the tx will be applied to the state
 
 				// wait before querying
-				err = client.WaitForHeight(c, apph, nil)
+				err = client.WaitForHeight(ctx, c, apph, nil)
 				require.NoError(t, err)
 
 				_qres, err := c.ABCIQueryWithOptions(ctx, "/key", k, client.ABCIQueryOptions{Prove: false})
@@ -358,6 +356,15 @@ func TestClientMethodCalls(t *testing.T) {
 				blockByHash, err := c.BlockByHash(ctx, block.BlockID.Hash)
 				require.NoError(t, err)
 				require.Equal(t, block, blockByHash)
+
+				// check that the header matches the block hash
+				header, err := c.Header(ctx, &apph)
+				require.NoError(t, err)
+				require.Equal(t, block.Block.Header, *header.Header)
+
+				headerByHash, err := c.HeaderByHash(ctx, block.BlockID.Hash)
+				require.NoError(t, err)
+				require.Equal(t, header, headerByHash)
 
 				// now check the results
 				blockResults, err := c.BlockResults(ctx, &txh)
@@ -402,21 +409,24 @@ func TestClientMethodCalls(t *testing.T) {
 				// XXX Test proof
 			})
 			t.Run("BlockchainInfo", func(t *testing.T) {
-				err := client.WaitForHeight(c, 10, nil)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+
+				err := client.WaitForHeight(ctx, c, 10, nil)
 				require.NoError(t, err)
 
 				res, err := c.BlockchainInfo(ctx, 0, 0)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.True(t, res.LastHeight > 0)
 				assert.True(t, len(res.BlockMetas) > 0)
 
 				res, err = c.BlockchainInfo(ctx, 1, 1)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.True(t, res.LastHeight > 0)
 				assert.True(t, len(res.BlockMetas) == 1)
 
 				res, err = c.BlockchainInfo(ctx, 1, 10000)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				assert.True(t, res.LastHeight > 0)
 				assert.True(t, len(res.BlockMetas) < 100)
 				for _, m := range res.BlockMetas {
@@ -424,16 +434,16 @@ func TestClientMethodCalls(t *testing.T) {
 				}
 
 				res, err = c.BlockchainInfo(ctx, 10000, 1)
-				require.NotNil(t, err)
+				require.Error(t, err)
 				assert.Nil(t, res)
 				assert.Contains(t, err.Error(), "can't be greater than max")
 			})
 			t.Run("BroadcastTxCommit", func(t *testing.T) {
 				_, _, tx := MakeTxKV()
 				bres, err := c.BroadcastTxCommit(ctx, tx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				require.True(t, bres.CheckTx.IsOK())
-				require.True(t, bres.DeliverTx.IsOK())
+				require.True(t, bres.TxResult.IsOK())
 
 				require.Equal(t, 0, pool.Size())
 			})
@@ -441,7 +451,7 @@ func TestClientMethodCalls(t *testing.T) {
 				_, _, tx := MakeTxKV()
 				initMempoolSize := pool.Size()
 				bres, err := c.BroadcastTxSync(ctx, tx)
-				require.Nil(t, err, "%d: %+v", i, err)
+				require.NoError(t, err, "%d: %+v", i, err)
 				require.Equal(t, bres.Code, abci.CodeTypeOK) // FIXME
 
 				require.Equal(t, initMempoolSize+1, pool.Size())
@@ -460,21 +470,12 @@ func TestClientMethodCalls(t *testing.T) {
 				assert.Equal(t, 0, pool.Size(), "mempool must be empty")
 			})
 			t.Run("Events", func(t *testing.T) {
-				// start for this test it if it wasn't already running
-				if !c.IsRunning() {
-					// if so, then we start it, listen, and stop it.
-					err := c.Start()
-					require.Nil(t, err)
-					t.Cleanup(func() {
-						if err := c.Stop(); err != nil {
-							t.Error(err)
-						}
-					})
-				}
-
 				t.Run("Header", func(t *testing.T) {
-					evt, err := client.WaitForOneEvent(c, types.EventNewBlockHeaderValue, waitForEventTimeout)
-					require.Nil(t, err, "%d: %+v", i, err)
+					ctx, cancel := context.WithTimeout(ctx, waitForEventTimeout)
+					defer cancel()
+					query := types.QueryForEvent(types.EventNewBlockHeaderValue).String()
+					evt, err := client.WaitForOneEvent(ctx, c, query)
+					require.NoError(t, err, "%d: %+v", i, err)
 					_, ok := evt.(types.EventDataNewBlockHeader)
 					require.True(t, ok, "%d: %#v", i, evt)
 					// TODO: more checks...
@@ -513,13 +514,18 @@ func TestClientMethodCalls(t *testing.T) {
 				})
 			})
 			t.Run("Evidence", func(t *testing.T) {
-				t.Run("BraodcastDuplicateVote", func(t *testing.T) {
-					chainID := conf.ChainID()
+				t.Run("BroadcastDuplicateVote", func(t *testing.T) {
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
 
-					correct, fakes := makeEvidences(t, pv, chainID)
+					chainID := conf.ChainID()
 
 					// make sure that the node has produced enough blocks
 					waitForBlock(ctx, t, c, 2)
+					evidenceHeight := int64(1)
+					block, _ := c.Block(ctx, &evidenceHeight)
+					ts := block.Block.Time
+					correct, fakes := makeEvidences(t, pv, chainID, ts)
 
 					result, err := c.BroadcastEvidence(ctx, correct)
 					require.NoError(t, err, "BroadcastEvidence(%s) failed", correct)
@@ -527,7 +533,7 @@ func TestClientMethodCalls(t *testing.T) {
 
 					status, err := c.Status(ctx)
 					require.NoError(t, err)
-					err = client.WaitForHeight(c, status.SyncInfo.LatestBlockHeight+2, nil)
+					err = client.WaitForHeight(ctx, c, status.SyncInfo.LatestBlockHeight+2, nil)
 					require.NoError(t, err)
 
 					ed25519pub := pv.Key.PubKey.(ed25519.PubKey)
@@ -551,11 +557,10 @@ func TestClientMethodCalls(t *testing.T) {
 						_, err := c.BroadcastEvidence(ctx, fake)
 						require.Error(t, err, "BroadcastEvidence(%s) succeeded, but the evidence was fake", fake)
 					}
-
 				})
 				t.Run("BroadcastEmpty", func(t *testing.T) {
 					_, err := c.BroadcastEvidence(ctx, nil)
-					assert.Error(t, err)
+					require.Error(t, err)
 				})
 			})
 		})
@@ -565,10 +570,10 @@ func TestClientMethodCalls(t *testing.T) {
 func getMempool(t *testing.T, srv service.Service) mempool.Mempool {
 	t.Helper()
 	n, ok := srv.(interface {
-		Mempool() mempool.Mempool
+		RPCEnvironment() *rpccore.Environment
 	})
 	require.True(t, ok)
-	return n.Mempool()
+	return n.RPCEnvironment().Mempool
 }
 
 // these cases are roughly the same as the TestClientMethodCalls, but
@@ -579,33 +584,50 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	n, conf := NodeSuite(t)
+	logger := log.NewTestingLogger(t)
+
+	n, conf := NodeSuite(ctx, t, logger)
 	pool := getMempool(t, n)
 
 	t.Run("UnconfirmedTxs", func(t *testing.T) {
-		_, _, tx := MakeTxKV()
-		ch := make(chan struct{})
+		// populate mempool with 5 tx
+		txs := make([]types.Tx, 5)
+		ch := make(chan error, 5)
+		for i := 0; i < 5; i++ {
+			_, _, tx := MakeTxKV()
 
-		err := pool.CheckTx(ctx, tx, func(_ *abci.Response) { close(ch) }, mempool.TxInfo{})
-		require.NoError(t, err)
+			txs[i] = tx
+			err := pool.CheckTx(ctx, tx, func(_ *abci.ResponseCheckTx) { ch <- nil }, mempool.TxInfo{})
 
-		// wait for tx to arrive in mempoool.
-		select {
-		case <-ch:
-		case <-time.After(5 * time.Second):
-			t.Error("Timed out waiting for CheckTx callback")
+			require.NoError(t, err)
 		}
+		// wait for tx to arrive in mempoool.
+		for i := 0; i < 5; i++ {
+			select {
+			case <-ch:
+			case <-time.After(5 * time.Second):
+				t.Error("Timed out waiting for CheckTx callback")
+			}
+		}
+		close(ch)
 
 		for _, c := range GetClients(t, n, conf) {
-			mc := c.(client.MempoolClient)
-			limit := 1
-			res, err := mc.UnconfirmedTxs(ctx, &limit)
-			require.NoError(t, err)
+			for i := 1; i <= 2; i++ {
+				mc := c.(client.MempoolClient)
+				page, perPage := i, 3
+				res, err := mc.UnconfirmedTxs(ctx, &page, &perPage)
+				require.NoError(t, err)
 
-			assert.Equal(t, 1, res.Count)
-			assert.Equal(t, 1, res.Total)
-			assert.Equal(t, pool.SizeBytes(), res.TotalBytes)
-			assert.Exactly(t, types.Txs{tx}, types.Txs(res.Txs))
+				if i == 2 {
+					perPage = 2
+				}
+				assert.Equal(t, perPage, res.Count)
+				assert.Equal(t, 5, res.Total)
+				assert.Equal(t, pool.SizeBytes(), res.TotalBytes)
+				for _, tx := range res.Txs {
+					assert.Contains(t, txs, tx)
+				}
+			}
 		}
 
 		pool.Flush()
@@ -617,7 +639,7 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 
 		_, _, tx := MakeTxKV()
 
-		err := pool.CheckTx(ctx, tx, func(_ *abci.Response) { close(ch) }, mempool.TxInfo{})
+		err := pool.CheckTx(ctx, tx, func(_ *abci.ResponseCheckTx) { close(ch) }, mempool.TxInfo{})
 		require.NoError(t, err)
 
 		// wait for tx to arrive in mempoool.
@@ -632,7 +654,7 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 			mc, ok := c.(client.MempoolClient)
 			require.True(t, ok, "%d", i)
 			res, err := mc.NumUnconfirmedTxs(ctx)
-			require.Nil(t, err, "%d: %+v", i, err)
+			require.NoError(t, err, "%d: %+v", i, err)
 
 			assert.Equal(t, mempoolSize, res.Count)
 			assert.Equal(t, mempoolSize, res.Total)
@@ -642,12 +664,14 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 		pool.Flush()
 	})
 	t.Run("Tx", func(t *testing.T) {
-		c := getHTTPClient(t, conf)
+		logger := log.NewTestingLogger(t)
+
+		c := getHTTPClient(t, logger, conf)
 
 		// first we broadcast a tx
 		_, _, tx := MakeTxKV()
 		bres, err := c.BroadcastTxCommit(ctx, tx)
-		require.Nil(t, err, "%+v", err)
+		require.NoError(t, err, "%+v", err)
 
 		txHeight := bres.Height
 		txHash := bres.Hash
@@ -677,9 +701,9 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 						ptx, err := c.Tx(ctx, tc.hash, tc.prove)
 
 						if !tc.valid {
-							require.NotNil(t, err)
+							require.Error(t, err)
 						} else {
-							require.Nil(t, err, "%+v", err)
+							require.NoError(t, err, "%+v", err)
 							assert.EqualValues(t, txHeight, ptx.Height)
 							assert.EqualValues(t, tx, ptx.Tx)
 							assert.Zero(t, ptx.Index)
@@ -698,7 +722,9 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 		}
 	})
 	t.Run("TxSearchWithTimeout", func(t *testing.T) {
-		timeoutClient := getHTTPClientWithTimeout(t, conf, 10*time.Second)
+		logger := log.NewTestingLogger(t)
+
+		timeoutClient := getHTTPClientWithTimeout(t, logger, conf, 10*time.Second)
 
 		_, _, tx := MakeTxKV()
 		_, err := timeoutClient.BroadcastTxCommit(ctx, tx)
@@ -706,12 +732,14 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 
 		// query using a compositeKey (see kvstore application)
 		result, err := timeoutClient.TxSearch(ctx, "app.creator='Cosmoshi Netowoko'", false, nil, nil, "asc")
-		require.Nil(t, err)
+		require.NoError(t, err)
 		require.Greater(t, len(result.Txs), 0, "expected a lot of transactions")
 	})
 	t.Run("TxSearch", func(t *testing.T) {
 		t.Skip("Test Asserts Non-Deterministic Results")
-		c := getHTTPClient(t, conf)
+		logger := log.NewTestingLogger(t)
+
+		c := getHTTPClient(t, logger, conf)
 
 		// first we broadcast a few txs
 		for i := 0; i < 10; i++ {
@@ -732,10 +760,9 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 
 		for _, c := range GetClients(t, n, conf) {
 			t.Run(fmt.Sprintf("%T", c), func(t *testing.T) {
-
 				// now we query for the tx.
 				result, err := c.TxSearch(ctx, fmt.Sprintf("tx.hash='%v'", find.Hash), true, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Len(t, result.Txs, 1)
 				require.Equal(t, find.Hash, result.Txs[0].Hash)
 
@@ -753,51 +780,51 @@ func TestClientMethodCallsAdvanced(t *testing.T) {
 
 				// query by height
 				result, err = c.TxSearch(ctx, fmt.Sprintf("tx.height=%d", find.Height), true, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Len(t, result.Txs, 1)
 
 				// query for non existing tx
 				result, err = c.TxSearch(ctx, fmt.Sprintf("tx.hash='%X'", anotherTxHash), false, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Len(t, result.Txs, 0)
 
 				// query using a compositeKey (see kvstore application)
 				result, err = c.TxSearch(ctx, "app.creator='Cosmoshi Netowoko'", false, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Greater(t, len(result.Txs), 0, "expected a lot of transactions")
 
 				// query using an index key
 				result, err = c.TxSearch(ctx, "app.index_key='index is working'", false, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Greater(t, len(result.Txs), 0, "expected a lot of transactions")
 
 				// query using an noindex key
 				result, err = c.TxSearch(ctx, "app.noindex_key='index is working'", false, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Equal(t, len(result.Txs), 0, "expected a lot of transactions")
 
 				// query using a compositeKey (see kvstore application) and height
 				result, err = c.TxSearch(ctx,
 					"app.creator='Cosmoshi Netowoko' AND tx.height<10000", true, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Greater(t, len(result.Txs), 0, "expected a lot of transactions")
 
 				// query a non existing tx with page 1 and txsPerPage 1
 				perPage := 1
 				result, err = c.TxSearch(ctx, "app.creator='Cosmoshi Neetowoko'", true, nil, &perPage, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				require.Len(t, result.Txs, 0)
 
 				// check sorting
 				result, err = c.TxSearch(ctx, "tx.height >= 1", false, nil, nil, "asc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				for k := 0; k < len(result.Txs)-1; k++ {
 					require.LessOrEqual(t, result.Txs[k].Height, result.Txs[k+1].Height)
 					require.LessOrEqual(t, result.Txs[k].Index, result.Txs[k+1].Index)
 				}
 
 				result, err = c.TxSearch(ctx, "tx.height >= 1", false, nil, nil, "desc")
-				require.Nil(t, err)
+				require.NoError(t, err)
 				for k := 0; k < len(result.Txs)-1; k++ {
 					require.GreaterOrEqual(t, result.Txs[k].Height, result.Txs[k+1].Height)
 					require.GreaterOrEqual(t, result.Txs[k].Index, result.Txs[k+1].Index)
@@ -858,7 +885,7 @@ func testBatchedJSONRPCCalls(ctx context.Context, t *testing.T, c *rpchttp.HTTP)
 	require.Equal(t, *bresult2, *r2)
 	apph := tmmath.MaxInt64(bresult1.Height, bresult2.Height) + 1
 
-	err = client.WaitForHeight(c, apph, nil)
+	err = client.WaitForHeight(ctx, c, apph, nil)
 	require.NoError(t, err)
 
 	q1, err := batch.ABCIQuery(ctx, "/key", k1)

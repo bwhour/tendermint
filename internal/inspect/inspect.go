@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/internal/eventbus"
@@ -41,8 +42,6 @@ type Inspector struct {
 // The Inspector type does not modify the state or block stores.
 // The sinks are used to enable block and transaction querying via the RPC server.
 // The caller is responsible for starting and stopping the Inspector service.
-///
-//nolint:lll
 func New(cfg *config.RPCConfig, bs state.BlockStore, ss state.Store, es []indexer.EventSink, logger log.Logger) *Inspector {
 	eb := eventbus.NewDefault(logger.With("module", "events"))
 
@@ -85,26 +84,18 @@ func NewFromConfig(logger log.Logger, cfg *config.Config) (*Inspector, error) {
 // Run starts the Inspector servers and blocks until the servers shut down. The passed
 // in context is used to control the lifecycle of the servers.
 func (ins *Inspector) Run(ctx context.Context) error {
-	err := ins.eventBus.Start()
+	err := ins.eventBus.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("error starting event bus: %s", err)
 	}
-	defer func() {
-		err := ins.eventBus.Stop()
-		if err != nil {
-			ins.logger.Error("event bus stopped with error", "err", err)
-		}
-	}()
-	err = ins.indexerService.Start()
+	defer ins.eventBus.Wait()
+
+	err = ins.indexerService.Start(ctx)
 	if err != nil {
 		return fmt.Errorf("error starting indexer service: %s", err)
 	}
-	defer func() {
-		err := ins.indexerService.Stop()
-		if err != nil {
-			ins.logger.Error("indexer service stopped with error", "err", err)
-		}
-	}()
+	defer ins.indexerService.Wait()
+
 	return startRPCServers(ctx, ins.config, ins.logger, ins.routes)
 }
 
@@ -127,7 +118,7 @@ func startRPCServers(ctx context.Context, cfg *config.RPCConfig, logger log.Logg
 				logger.Info("RPC HTTPS server starting", "address", listenerAddr,
 					"certfile", certFile, "keyfile", keyFile)
 				err := server.ListenAndServeTLS(tctx, certFile, keyFile)
-				if !errors.Is(err, net.ErrClosed) {
+				if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 					return err
 				}
 				logger.Info("RPC HTTPS server stopped", "address", listenerAddr)
@@ -138,7 +129,7 @@ func startRPCServers(ctx context.Context, cfg *config.RPCConfig, logger log.Logg
 			g.Go(func() error {
 				logger.Info("RPC HTTP server starting", "address", listenerAddr)
 				err := server.ListenAndServe(tctx)
-				if !errors.Is(err, net.ErrClosed) {
+				if !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 					return err
 				}
 				logger.Info("RPC HTTP server stopped", "address", listenerAddr)

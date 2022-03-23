@@ -2,10 +2,11 @@
 package events
 
 import (
+	"context"
 	"fmt"
+	"sync"
 
-	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
-	"github.com/tendermint/tendermint/libs/service"
+	"github.com/tendermint/tendermint/libs/log"
 )
 
 // ErrListenerWasRemoved is returned by AddEvent if the listener was removed.
@@ -32,7 +33,7 @@ type Eventable interface {
 //
 // FireEvent fires an event with the given name and data.
 type Fireable interface {
-	FireEvent(eventValue string, data EventData)
+	FireEvent(ctx context.Context, eventValue string, data EventData)
 }
 
 // EventSwitch is the interface for synchronous pubsub, where listeners
@@ -43,36 +44,23 @@ type Fireable interface {
 // They can be removed by calling either RemoveListenerForEvent or
 // RemoveListener (for all events).
 type EventSwitch interface {
-	service.Service
 	Fireable
-
 	AddListenerForEvent(listenerID, eventValue string, cb EventCallback) error
-	RemoveListenerForEvent(event string, listenerID string)
-	RemoveListener(listenerID string)
 }
 
 type eventSwitch struct {
-	service.BaseService
-
-	mtx        tmsync.RWMutex
+	mtx        sync.RWMutex
 	eventCells map[string]*eventCell
 	listeners  map[string]*eventListener
 }
 
-func NewEventSwitch() EventSwitch {
+func NewEventSwitch(logger log.Logger) EventSwitch {
 	evsw := &eventSwitch{
 		eventCells: make(map[string]*eventCell),
 		listeners:  make(map[string]*eventListener),
 	}
-	evsw.BaseService = *service.NewBaseService(nil, "EventSwitch", evsw)
 	return evsw
 }
-
-func (evsw *eventSwitch) OnStart() error {
-	return nil
-}
-
-func (evsw *eventSwitch) OnStop() {}
 
 func (evsw *eventSwitch) AddListenerForEvent(listenerID, eventValue string, cb EventCallback) error {
 	// Get/Create eventCell and listener.
@@ -100,53 +88,7 @@ func (evsw *eventSwitch) AddListenerForEvent(listenerID, eventValue string, cb E
 	return nil
 }
 
-func (evsw *eventSwitch) RemoveListener(listenerID string) {
-	// Get and remove listener.
-	evsw.mtx.RLock()
-	listener := evsw.listeners[listenerID]
-	evsw.mtx.RUnlock()
-	if listener == nil {
-		return
-	}
-
-	evsw.mtx.Lock()
-	delete(evsw.listeners, listenerID)
-	evsw.mtx.Unlock()
-
-	// Remove callback for each event.
-	listener.SetRemoved()
-	for _, event := range listener.GetEvents() {
-		evsw.RemoveListenerForEvent(event, listenerID)
-	}
-}
-
-func (evsw *eventSwitch) RemoveListenerForEvent(event string, listenerID string) {
-	// Get eventCell
-	evsw.mtx.Lock()
-	eventCell := evsw.eventCells[event]
-	evsw.mtx.Unlock()
-
-	if eventCell == nil {
-		return
-	}
-
-	// Remove listenerID from eventCell
-	numListeners := eventCell.RemoveListener(listenerID)
-
-	// Maybe garbage collect eventCell.
-	if numListeners == 0 {
-		// Lock again and double check.
-		evsw.mtx.Lock()      // OUTER LOCK
-		eventCell.mtx.Lock() // INNER LOCK
-		if len(eventCell.listeners) == 0 {
-			delete(evsw.eventCells, event)
-		}
-		eventCell.mtx.Unlock() // INNER LOCK
-		evsw.mtx.Unlock()      // OUTER LOCK
-	}
-}
-
-func (evsw *eventSwitch) FireEvent(event string, data EventData) {
+func (evsw *eventSwitch) FireEvent(ctx context.Context, event string, data EventData) {
 	// Get the eventCell
 	evsw.mtx.RLock()
 	eventCell := evsw.eventCells[event]
@@ -157,14 +99,14 @@ func (evsw *eventSwitch) FireEvent(event string, data EventData) {
 	}
 
 	// Fire event for all listeners in eventCell
-	eventCell.FireEvent(data)
+	eventCell.FireEvent(ctx, data)
 }
 
 //-----------------------------------------------------------------------------
 
 // eventCell handles keeping track of listener callbacks for a given event.
 type eventCell struct {
-	mtx       tmsync.RWMutex
+	mtx       sync.RWMutex
 	listeners map[string]EventCallback
 }
 
@@ -188,7 +130,7 @@ func (cell *eventCell) RemoveListener(listenerID string) int {
 	return numListeners
 }
 
-func (cell *eventCell) FireEvent(data EventData) {
+func (cell *eventCell) FireEvent(ctx context.Context, data EventData) {
 	cell.mtx.RLock()
 	eventCallbacks := make([]EventCallback, 0, len(cell.listeners))
 	for _, cb := range cell.listeners {
@@ -197,18 +139,21 @@ func (cell *eventCell) FireEvent(data EventData) {
 	cell.mtx.RUnlock()
 
 	for _, cb := range eventCallbacks {
-		cb(data)
+		if err := cb(ctx, data); err != nil {
+			// should we log or abort here?
+			continue
+		}
 	}
 }
 
 //-----------------------------------------------------------------------------
 
-type EventCallback func(data EventData)
+type EventCallback func(ctx context.Context, data EventData) error
 
 type eventListener struct {
 	id string
 
-	mtx     tmsync.RWMutex
+	mtx     sync.RWMutex
 	removed bool
 	events  []string
 }

@@ -1,7 +1,10 @@
 package factory
 
 import (
+	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/tmhash"
@@ -16,13 +19,6 @@ const (
 var (
 	DefaultTestTime = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 )
-
-func MakeVersion() version.Consensus {
-	return version.Consensus{
-		Block: version.BlockProtocol,
-		App:   1,
-	}
-}
 
 func RandomAddress() []byte {
 	return crypto.CRandBytes(crypto.AddressSize)
@@ -48,14 +44,15 @@ func MakeBlockIDWithHash(hash []byte) types.BlockID {
 
 // MakeHeader fills the rest of the contents of the header such that it passes
 // validate basic
-func MakeHeader(h *types.Header) (*types.Header, error) {
+func MakeHeader(t *testing.T, h *types.Header) *types.Header {
+	t.Helper()
 	if h.Version.Block == 0 {
 		h.Version.Block = version.BlockProtocol
 	}
 	if h.Height == 0 {
 		h.Height = 1
 	}
-	if h.LastBlockID.IsZero() {
+	if h.LastBlockID.IsNil() {
 		h.LastBlockID = MakeBlockID()
 	}
 	if h.ChainID == "" {
@@ -89,13 +86,7 @@ func MakeHeader(h *types.Header) (*types.Header, error) {
 		h.ProposerAddress = RandomAddress()
 	}
 
-	return h, h.ValidateBasic()
-}
+	require.NoError(t, h.ValidateBasic())
 
-func MakeRandomHeader() *types.Header {
-	h, err := MakeHeader(&types.Header{})
-	if err != nil {
-		panic(err)
-	}
 	return h
 }

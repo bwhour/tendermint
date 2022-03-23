@@ -12,24 +12,22 @@ import (
 
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/internal/eventbus"
+	tmpubsub "github.com/tendermint/tendermint/internal/pubsub"
+	tmquery "github.com/tendermint/tendermint/internal/pubsub/query"
 	"github.com/tendermint/tendermint/libs/log"
-	tmpubsub "github.com/tendermint/tendermint/libs/pubsub"
-	tmquery "github.com/tendermint/tendermint/libs/pubsub/query"
 	"github.com/tendermint/tendermint/types"
 )
 
 func TestEventBusPublishEventTx(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
 
 	tx := types.Tx("foo")
-	result := abci.ResponseDeliverTx{
+	result := abci.ExecTxResult{
 		Data: []byte("bar"),
 		Events: []abci.Event{
 			{Type: "testType", Attributes: []abci.EventAttribute{{Key: "baz", Value: "1"}}},
@@ -37,11 +35,10 @@ func TestEventBusPublishEventTx(t *testing.T) {
 	}
 
 	// PublishEventTx adds 3 composite keys, so the query below should work
-	ctx := context.Background()
 	query := fmt.Sprintf("tm.event='Tx' AND tx.height=1 AND tx.hash='%X' AND testType.baz=1", tx.Hash())
 	txsSub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 		ClientID: "test",
-		Query:    tmquery.MustParse(query),
+		Query:    tmquery.MustCompile(query),
 	})
 	require.NoError(t, err)
 
@@ -58,7 +55,7 @@ func TestEventBusPublishEventTx(t *testing.T) {
 		assert.Equal(t, result, edt.Result)
 	}()
 
-	err = eventBus.PublishEventTx(types.EventDataTx{
+	err = eventBus.PublishEventTx(ctx, types.EventDataTx{
 		TxResult: abci.TxResult{
 			Height: 1,
 			Index:  0,
@@ -76,34 +73,30 @@ func TestEventBusPublishEventTx(t *testing.T) {
 }
 
 func TestEventBusPublishEventNewBlock(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
 
 	block := types.MakeBlock(0, []types.Tx{}, nil, []types.Evidence{})
-	blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: block.MakePartSet(types.BlockPartSizeBytes).Header()}
-	resultBeginBlock := abci.ResponseBeginBlock{
+	bps, err := block.MakePartSet(types.BlockPartSizeBytes)
+	require.NoError(t, err)
+	blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: bps.Header()}
+	resultFinalizeBlock := abci.ResponseFinalizeBlock{
 		Events: []abci.Event{
-			{Type: "testType", Attributes: []abci.EventAttribute{{Key: "baz", Value: "1"}}},
-		},
-	}
-	resultEndBlock := abci.ResponseEndBlock{
-		Events: []abci.Event{
-			{Type: "testType", Attributes: []abci.EventAttribute{{Key: "foz", Value: "2"}}},
+			{Type: "testType", Attributes: []abci.EventAttribute{
+				{Key: "baz", Value: "1"},
+				{Key: "foz", Value: "2"},
+			}},
 		},
 	}
 
 	// PublishEventNewBlock adds the tm.event compositeKey, so the query below should work
-	ctx := context.Background()
 	query := "tm.event='NewBlock' AND testType.baz=1 AND testType.foz=2"
 	blocksSub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 		ClientID: "test",
-		Query:    tmquery.MustParse(query),
+		Query:    tmquery.MustCompile(query),
 	})
 	require.NoError(t, err)
 
@@ -116,15 +109,13 @@ func TestEventBusPublishEventNewBlock(t *testing.T) {
 		edt := msg.Data().(types.EventDataNewBlock)
 		assert.Equal(t, block, edt.Block)
 		assert.Equal(t, blockID, edt.BlockID)
-		assert.Equal(t, resultBeginBlock, edt.ResultBeginBlock)
-		assert.Equal(t, resultEndBlock, edt.ResultEndBlock)
+		assert.Equal(t, resultFinalizeBlock, edt.ResultFinalizeBlock)
 	}()
 
-	err = eventBus.PublishEventNewBlock(types.EventDataNewBlock{
-		Block:            block,
-		BlockID:          blockID,
-		ResultBeginBlock: resultBeginBlock,
-		ResultEndBlock:   resultEndBlock,
+	err = eventBus.PublishEventNewBlock(ctx, types.EventDataNewBlock{
+		Block:               block,
+		BlockID:             blockID,
+		ResultFinalizeBlock: resultFinalizeBlock,
 	})
 	assert.NoError(t, err)
 
@@ -136,17 +127,14 @@ func TestEventBusPublishEventNewBlock(t *testing.T) {
 }
 
 func TestEventBusPublishEventTxDuplicateKeys(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
 
 	tx := types.Tx("foo")
-	result := abci.ResponseDeliverTx{
+	result := abci.ExecTxResult{
 		Data: []byte("bar"),
 		Events: []abci.Event{
 			{
@@ -203,73 +191,81 @@ func TestEventBusPublishEventTxDuplicateKeys(t *testing.T) {
 	}
 
 	for i, tc := range testCases {
-		ctx := context.Background()
-		sub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
-			ClientID: fmt.Sprintf("client-%d", i),
-			Query:    tmquery.MustParse(tc.query),
-		})
-		require.NoError(t, err)
+		var name string
 
-		gotResult := make(chan bool, 1)
-		go func() {
-			defer close(gotResult)
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
-			msg, err := sub.Next(ctx)
-			if err == nil {
-				data := msg.Data().(types.EventDataTx)
-				assert.Equal(t, int64(1), data.Height)
-				assert.Equal(t, uint32(0), data.Index)
-				assert.EqualValues(t, tx, data.Tx)
-				assert.Equal(t, result, data.Result)
-				gotResult <- true
-			}
-		}()
-
-		assert.NoError(t, eventBus.PublishEventTx(types.EventDataTx{
-			TxResult: abci.TxResult{
-				Height: 1,
-				Index:  0,
-				Tx:     tx,
-				Result: result,
-			},
-		}))
-
-		if got := <-gotResult; got != tc.expectResults {
-			require.Failf(t, "Wrong transaction result",
-				"got a tx: %v, wanted a tx: %v", got, tc.expectResults)
+		if tc.expectResults {
+			name = fmt.Sprintf("ExpetedResultsCase%d", i)
+		} else {
+			name = fmt.Sprintf("NoResultsCase%d", i)
 		}
+
+		t.Run(name, func(t *testing.T) {
+
+			sub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
+				ClientID: fmt.Sprintf("client-%d", i),
+				Query:    tmquery.MustCompile(tc.query),
+			})
+			require.NoError(t, err)
+
+			gotResult := make(chan bool, 1)
+			go func() {
+				defer close(gotResult)
+				tctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+				defer cancel()
+				msg, err := sub.Next(tctx)
+				if err == nil {
+					data := msg.Data().(types.EventDataTx)
+					assert.Equal(t, int64(1), data.Height)
+					assert.Equal(t, uint32(0), data.Index)
+					assert.EqualValues(t, tx, data.Tx)
+					assert.Equal(t, result, data.Result)
+					gotResult <- true
+				}
+			}()
+
+			assert.NoError(t, eventBus.PublishEventTx(ctx, types.EventDataTx{
+				TxResult: abci.TxResult{
+					Height: 1,
+					Index:  0,
+					Tx:     tx,
+					Result: result,
+				},
+			}))
+
+			require.NoError(t, ctx.Err(), "context should not have been canceled")
+
+			if got := <-gotResult; got != tc.expectResults {
+				require.Failf(t, "Wrong transaction result",
+					"got a tx: %v, wanted a tx: %v", got, tc.expectResults)
+			}
+		})
+
 	}
 }
 
 func TestEventBusPublishEventNewBlockHeader(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
 
 	block := types.MakeBlock(0, []types.Tx{}, nil, []types.Evidence{})
-	resultBeginBlock := abci.ResponseBeginBlock{
+	resultFinalizeBlock := abci.ResponseFinalizeBlock{
 		Events: []abci.Event{
-			{Type: "testType", Attributes: []abci.EventAttribute{{Key: "baz", Value: "1"}}},
-		},
-	}
-	resultEndBlock := abci.ResponseEndBlock{
-		Events: []abci.Event{
-			{Type: "testType", Attributes: []abci.EventAttribute{{Key: "foz", Value: "2"}}},
+			{Type: "testType", Attributes: []abci.EventAttribute{
+				{Key: "baz", Value: "1"},
+				{Key: "foz", Value: "2"},
+			}},
 		},
 	}
 
 	// PublishEventNewBlockHeader adds the tm.event compositeKey, so the query below should work
-	ctx := context.Background()
 	query := "tm.event='NewBlockHeader' AND testType.baz=1 AND testType.foz=2"
 	headersSub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 		ClientID: "test",
-		Query:    tmquery.MustParse(query),
+		Query:    tmquery.MustCompile(query),
 	})
 	require.NoError(t, err)
 
@@ -281,14 +277,12 @@ func TestEventBusPublishEventNewBlockHeader(t *testing.T) {
 
 		edt := msg.Data().(types.EventDataNewBlockHeader)
 		assert.Equal(t, block.Header, edt.Header)
-		assert.Equal(t, resultBeginBlock, edt.ResultBeginBlock)
-		assert.Equal(t, resultEndBlock, edt.ResultEndBlock)
+		assert.Equal(t, resultFinalizeBlock, edt.ResultFinalizeBlock)
 	}()
 
-	err = eventBus.PublishEventNewBlockHeader(types.EventDataNewBlockHeader{
-		Header:           block.Header,
-		ResultBeginBlock: resultBeginBlock,
-		ResultEndBlock:   resultEndBlock,
+	err = eventBus.PublishEventNewBlockHeader(ctx, types.EventDataNewBlockHeader{
+		Header:              block.Header,
+		ResultFinalizeBlock: resultFinalizeBlock,
 	})
 	assert.NoError(t, err)
 
@@ -299,23 +293,63 @@ func TestEventBusPublishEventNewBlockHeader(t *testing.T) {
 	}
 }
 
-func TestEventBusPublishEventNewEvidence(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+func TestEventBusPublishEventEvidenceValidated(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
+
+	ev, err := types.NewMockDuplicateVoteEvidence(ctx, 1, time.Now(), "test-chain-id")
+	require.NoError(t, err)
+
+	const query = `tm.event='EvidenceValidated'`
+	evSub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
+		ClientID: "test",
+		Query:    tmquery.MustCompile(query),
 	})
 
-	ev := types.NewMockDuplicateVoteEvidence(1, time.Now(), "test-chain-id")
+	require.NoError(t, err)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		msg, err := evSub.Next(ctx)
+		assert.NoError(t, err)
 
-	ctx := context.Background()
+		edt := msg.Data().(types.EventDataEvidenceValidated)
+		assert.Equal(t, ev, edt.Evidence)
+		assert.Equal(t, int64(1), edt.Height)
+	}()
+
+	err = eventBus.PublishEventEvidenceValidated(ctx, types.EventDataEvidenceValidated{
+		Evidence: ev,
+		Height:   int64(1),
+	})
+	assert.NoError(t, err)
+
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("did not receive a block header after 1 sec.")
+	}
+
+}
+func TestEventBusPublishEventNewEvidence(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
+	require.NoError(t, err)
+
+	ev, err := types.NewMockDuplicateVoteEvidence(ctx, 1, time.Now(), "test-chain-id")
+	require.NoError(t, err)
+
 	const query = `tm.event='NewEvidence'`
 	evSub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 		ClientID: "test",
-		Query:    tmquery.MustParse(query),
+		Query:    tmquery.MustCompile(query),
 	})
 	require.NoError(t, err)
 
@@ -330,7 +364,7 @@ func TestEventBusPublishEventNewEvidence(t *testing.T) {
 		assert.Equal(t, int64(4), edt.Height)
 	}()
 
-	err = eventBus.PublishEventNewEvidence(types.EventDataNewEvidence{
+	err = eventBus.PublishEventNewEvidence(ctx, types.EventDataNewEvidence{
 		Evidence: ev,
 		Height:   4,
 	})
@@ -344,21 +378,18 @@ func TestEventBusPublishEventNewEvidence(t *testing.T) {
 }
 
 func TestEventBusPublish(t *testing.T) {
-	eventBus := eventbus.NewDefault(log.TestingLogger())
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger())
+	err := eventBus.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
 
 	const numEventsExpected = 14
 
-	ctx := context.Background()
 	sub, err := eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 		ClientID: "test",
-		Query:    tmquery.Empty{},
+		Query:    tmquery.All,
 		Limit:    numEventsExpected,
 	})
 	require.NoError(t, err)
@@ -377,23 +408,22 @@ func TestEventBusPublish(t *testing.T) {
 		}
 	}()
 
-	require.NoError(t, eventBus.Publish(types.EventNewBlockHeaderValue,
+	require.NoError(t, eventBus.Publish(ctx, types.EventNewBlockHeaderValue,
 		types.EventDataNewBlockHeader{}))
-	require.NoError(t, eventBus.PublishEventNewBlock(types.EventDataNewBlock{}))
-	require.NoError(t, eventBus.PublishEventNewBlockHeader(types.EventDataNewBlockHeader{}))
-	require.NoError(t, eventBus.PublishEventVote(types.EventDataVote{}))
-	require.NoError(t, eventBus.PublishEventNewRoundStep(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventTimeoutPropose(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventTimeoutWait(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventNewRound(types.EventDataNewRound{}))
-	require.NoError(t, eventBus.PublishEventCompleteProposal(types.EventDataCompleteProposal{}))
-	require.NoError(t, eventBus.PublishEventPolka(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventUnlock(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventRelock(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventLock(types.EventDataRoundState{}))
-	require.NoError(t, eventBus.PublishEventValidatorSetUpdates(types.EventDataValidatorSetUpdates{}))
-	require.NoError(t, eventBus.PublishEventBlockSyncStatus(types.EventDataBlockSyncStatus{}))
-	require.NoError(t, eventBus.PublishEventStateSyncStatus(types.EventDataStateSyncStatus{}))
+	require.NoError(t, eventBus.PublishEventNewBlock(ctx, types.EventDataNewBlock{}))
+	require.NoError(t, eventBus.PublishEventNewBlockHeader(ctx, types.EventDataNewBlockHeader{}))
+	require.NoError(t, eventBus.PublishEventVote(ctx, types.EventDataVote{}))
+	require.NoError(t, eventBus.PublishEventNewRoundStep(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventTimeoutPropose(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventTimeoutWait(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventNewRound(ctx, types.EventDataNewRound{}))
+	require.NoError(t, eventBus.PublishEventCompleteProposal(ctx, types.EventDataCompleteProposal{}))
+	require.NoError(t, eventBus.PublishEventPolka(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventRelock(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventLock(ctx, types.EventDataRoundState{}))
+	require.NoError(t, eventBus.PublishEventValidatorSetUpdates(ctx, types.EventDataValidatorSetUpdates{}))
+	require.NoError(t, eventBus.PublishEventBlockSyncStatus(ctx, types.EventDataBlockSyncStatus{}))
+	require.NoError(t, eventBus.PublishEventStateSyncStatus(ctx, types.EventDataStateSyncStatus{}))
 
 	require.GreaterOrEqual(t, <-count, numEventsExpected)
 }
@@ -434,18 +464,16 @@ func benchmarkEventBus(numClients int, randQueries bool, randEvents bool, b *tes
 	// for random* functions
 	mrand.Seed(time.Now().Unix())
 
-	eventBus := eventbus.NewDefault(log.TestingLogger()) // set buffer capacity to 0 so we are not testing cache
-	err := eventBus.Start()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := eventbus.NewDefault(log.NewNopLogger()) // set buffer capacity to 0 so we are not testing cache
+	err := eventBus.Start(ctx)
 	if err != nil {
 		b.Error(err)
 	}
-	b.Cleanup(func() {
-		if err := eventBus.Stop(); err != nil {
-			b.Error(err)
-		}
-	})
+	b.Cleanup(eventBus.Wait)
 
-	ctx := context.Background()
 	q := types.EventQueryNewBlock
 
 	for i := 0; i < numClients; i++ {
@@ -477,7 +505,7 @@ func benchmarkEventBus(numClients int, randQueries bool, randEvents bool, b *tes
 			eventValue = randEventValue()
 		}
 
-		err := eventBus.Publish(eventValue, types.EventDataString("Gamora"))
+		err := eventBus.Publish(ctx, eventValue, types.EventDataString("Gamora"))
 		if err != nil {
 			b.Error(err)
 		}
@@ -492,7 +520,6 @@ var events = []string{
 	types.EventTimeoutProposeValue,
 	types.EventCompleteProposalValue,
 	types.EventPolkaValue,
-	types.EventUnlockValue,
 	types.EventLockValue,
 	types.EventRelockValue,
 	types.EventTimeoutWaitValue,
@@ -505,7 +532,7 @@ func randEventValue() string {
 	return events[mrand.Intn(len(events))]
 }
 
-var queries = []tmpubsub.Query{
+var queries = []*tmquery.Query{
 	types.EventQueryNewBlock,
 	types.EventQueryNewBlockHeader,
 	types.EventQueryNewRound,
@@ -513,7 +540,6 @@ var queries = []tmpubsub.Query{
 	types.EventQueryTimeoutPropose,
 	types.EventQueryCompleteProposal,
 	types.EventQueryPolka,
-	types.EventQueryUnlock,
 	types.EventQueryLock,
 	types.EventQueryRelock,
 	types.EventQueryTimeoutWait,
@@ -522,6 +548,6 @@ var queries = []tmpubsub.Query{
 	types.EventQueryStateSyncStatus,
 }
 
-func randQuery() tmpubsub.Query {
+func randQuery() *tmquery.Query {
 	return queries[mrand.Intn(len(queries))]
 }

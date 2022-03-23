@@ -1,6 +1,5 @@
 #!/usr/bin/make -f
 
-PACKAGES=$(shell go list ./...)
 BUILDDIR ?= $(CURDIR)/build
 
 BUILD_TAGS?=tendermint
@@ -14,7 +13,6 @@ endif
 
 LD_FLAGS = -X github.com/tendermint/tendermint/version.TMVersion=$(VERSION)
 BUILD_FLAGS = -mod=readonly -ldflags "$(LD_FLAGS)"
-DOCKER_PROTO_BUILDER := docker run -v $(shell pwd):/workspace --workdir /workspace tendermintdev/docker-build-proto
 CGO_ENABLED ?= 0
 
 # handle nostrip
@@ -78,16 +76,52 @@ $(BUILDDIR)/:
 ###                                Protobuf                                 ###
 ###############################################################################
 
-proto-gen:
-	@docker pull -q tendermintdev/docker-build-proto
+check-proto-deps:
+ifeq (,$(shell which buf))
+	$(error "buf is required for Protobuf building, linting and breakage checking. See https://docs.buf.build/installation for installation instructions.")
+endif
+ifeq (,$(shell which protoc-gen-gogofaster))
+	$(error "gogofaster plugin for protoc is required. Run 'go install github.com/gogo/protobuf/protoc-gen-gogofaster@latest' to install")
+endif
+.PHONY: check-proto-deps
+
+check-proto-format-deps:
+ifeq (,$(shell which clang-format))
+	$(error "clang-format is required for Protobuf formatting. See instructions for your platform on how to install it.")
+endif
+.PHONY: check-proto-format-deps
+
+proto-gen: check-proto-deps
 	@echo "Generating Protobuf files"
-	@$(DOCKER_PROTO_BUILDER) sh ./scripts/protocgen.sh
+	@buf generate
+	@mv ./proto/tendermint/abci/types.pb.go ./abci/types/
 .PHONY: proto-gen
 
-proto-format:
+# These targets are provided for convenience and are intended for local
+# execution only.
+proto-lint: check-proto-deps
+	@echo "Linting Protobuf files"
+	@buf lint
+.PHONY: proto-lint
+
+proto-format: check-proto-format-deps
 	@echo "Formatting Protobuf files"
-	@$(DOCKER_PROTO_BUILDER) find ./ -not -path "./third_party/*" -name *.proto -exec clang-format -i {} \;
+	@find . -name '*.proto' -path "./proto/*" -exec clang-format -i {} \;
 .PHONY: proto-format
+
+proto-check-breaking: check-proto-deps
+	@echo "Checking for breaking changes in Protobuf files against local branch"
+	@echo "Note: This is only useful if your changes have not yet been committed."
+	@echo "      Otherwise read up on buf's \"breaking\" command usage:"
+	@echo "      https://docs.buf.build/breaking/usage"
+	@buf breaking --against ".git"
+.PHONY: proto-check-breaking
+
+# TODO: Should be removed when work on ABCI++ is complete.
+# For more information, see https://github.com/tendermint/tendermint/issues/8066
+abci-proto-gen:
+	./scripts/abci-gen.sh
+.PHONY: abci-proto-gen
 
 ###############################################################################
 ###                              Build ABCI                                 ###
@@ -102,7 +136,7 @@ install_abci:
 .PHONY: install_abci
 
 ###############################################################################
-###                           	Privval Server                              ###
+###				Privval Server                              ###
 ###############################################################################
 
 build_privval_server:
@@ -287,3 +321,26 @@ build-reproducible:
 		--name latest-build cosmossdk/rbuilder:latest
 	docker cp -a latest-build:/home/builder/artifacts/ $(CURDIR)/
 .PHONY: build-reproducible
+
+# Implements test splitting and running. This is pulled directly from
+# the github action workflows for better local reproducibility.
+
+GO_TEST_FILES != find $(CURDIR) -name "*_test.go"
+
+# default to four splits by default
+NUM_SPLIT ?= 4
+
+$(BUILDDIR):
+	mkdir -p $@
+
+# The format statement filters out all packages that don't have tests.
+# Note we need to check for both in-package tests (.TestGoFiles) and
+# out-of-package tests (.XTestGoFiles).
+$(BUILDDIR)/packages.txt:$(GO_TEST_FILES) $(BUILDDIR)
+	go list -f "{{ if (or .TestGoFiles .XTestGoFiles) }}{{ .ImportPath }}{{ end }}" ./... | sort > $@
+
+split-test-packages:$(BUILDDIR)/packages.txt
+	split -d -n l/$(NUM_SPLIT) $< $<.
+test-group-%:split-test-packages
+	cat $(BUILDDIR)/packages.txt.$* | xargs go test -mod=readonly -timeout=5m -race -coverprofile=$(BUILDDIR)/$*.profile.out
+

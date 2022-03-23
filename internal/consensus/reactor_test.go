@@ -2,9 +2,9 @@ package consensus
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"path"
 	"sync"
 	"testing"
 	"time"
@@ -21,16 +21,15 @@ import (
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/crypto/encoding"
 	"github.com/tendermint/tendermint/internal/eventbus"
-	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
 	"github.com/tendermint/tendermint/internal/mempool"
 	"github.com/tendermint/tendermint/internal/p2p"
 	"github.com/tendermint/tendermint/internal/p2p/p2ptest"
+	tmpubsub "github.com/tendermint/tendermint/internal/pubsub"
 	sm "github.com/tendermint/tendermint/internal/state"
 	statemocks "github.com/tendermint/tendermint/internal/state/mocks"
 	"github.com/tendermint/tendermint/internal/store"
 	"github.com/tendermint/tendermint/internal/test/factory"
 	"github.com/tendermint/tendermint/libs/log"
-	tmpubsub "github.com/tendermint/tendermint/libs/pubsub"
 	tmcons "github.com/tendermint/tendermint/proto/tendermint/consensus"
 	"github.com/tendermint/tendermint/types"
 )
@@ -59,41 +58,62 @@ func chDesc(chID p2p.ChannelID, size int) *p2p.ChannelDescriptor {
 	}
 }
 
-func setup(t *testing.T, numNodes int, states []*State, size int) *reactorTestSuite {
+func setup(
+	ctx context.Context,
+	t *testing.T,
+	numNodes int,
+	states []*State,
+	size int,
+) *reactorTestSuite {
 	t.Helper()
 
 	rts := &reactorTestSuite{
-		network:       p2ptest.MakeNetwork(t, p2ptest.NetworkOptions{NumNodes: numNodes}),
+		network:       p2ptest.MakeNetwork(ctx, t, p2ptest.NetworkOptions{NumNodes: numNodes}),
 		states:        make(map[types.NodeID]*State),
 		reactors:      make(map[types.NodeID]*Reactor, numNodes),
 		subs:          make(map[types.NodeID]eventbus.Subscription, numNodes),
 		blocksyncSubs: make(map[types.NodeID]eventbus.Subscription, numNodes),
 	}
 
-	rts.stateChannels = rts.network.MakeChannelsNoCleanup(t, chDesc(StateChannel, size))
-	rts.dataChannels = rts.network.MakeChannelsNoCleanup(t, chDesc(DataChannel, size))
-	rts.voteChannels = rts.network.MakeChannelsNoCleanup(t, chDesc(VoteChannel, size))
-	rts.voteSetBitsChannels = rts.network.MakeChannelsNoCleanup(t, chDesc(VoteSetBitsChannel, size))
+	rts.stateChannels = rts.network.MakeChannelsNoCleanup(ctx, t, chDesc(StateChannel, size))
+	rts.dataChannels = rts.network.MakeChannelsNoCleanup(ctx, t, chDesc(DataChannel, size))
+	rts.voteChannels = rts.network.MakeChannelsNoCleanup(ctx, t, chDesc(VoteChannel, size))
+	rts.voteSetBitsChannels = rts.network.MakeChannelsNoCleanup(ctx, t, chDesc(VoteSetBitsChannel, size))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Canceled during cleanup (see below).
+	ctx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
+
+	chCreator := func(nodeID types.NodeID) p2p.ChannelCreator {
+		return func(ctx context.Context, desc *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+			switch desc.ID {
+			case StateChannel:
+				return rts.stateChannels[nodeID], nil
+			case DataChannel:
+				return rts.dataChannels[nodeID], nil
+			case VoteChannel:
+				return rts.voteChannels[nodeID], nil
+			case VoteSetBitsChannel:
+				return rts.voteSetBitsChannels[nodeID], nil
+			default:
+				return nil, fmt.Errorf("invalid channel; %v", desc.ID)
+			}
+		}
+	}
 
 	i := 0
 	for nodeID, node := range rts.network.Nodes {
 		state := states[i]
 
-		reactor := NewReactor(
-			state.Logger.With("node", nodeID),
+		reactor, err := NewReactor(ctx,
+			state.logger.With("node", nodeID),
 			state,
-			rts.stateChannels[nodeID],
-			rts.dataChannels[nodeID],
-			rts.voteChannels[nodeID],
-			rts.voteSetBitsChannels[nodeID],
-			node.MakePeerUpdates(t),
+			chCreator(nodeID),
+			node.MakePeerUpdates(ctx, t),
+			state.eventBus,
 			true,
+			NopMetrics(),
 		)
-
-		reactor.SetEventBus(state.eventBus)
+		require.NoError(t, err)
 
 		blocksSub, err := state.eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 			ClientID: testSubscriber,
@@ -119,8 +139,9 @@ func setup(t *testing.T, numNodes int, states []*State, size int) *reactorTestSu
 			require.NoError(t, state.blockExec.Store().Save(state.state))
 		}
 
-		require.NoError(t, reactor.Start())
+		require.NoError(t, reactor.Start(ctx))
 		require.True(t, reactor.IsRunning())
+		t.Cleanup(reactor.Wait)
 
 		i++
 	}
@@ -128,18 +149,9 @@ func setup(t *testing.T, numNodes int, states []*State, size int) *reactorTestSu
 	require.Len(t, rts.reactors, numNodes)
 
 	// start the in-memory network and connect all peers with each other
-	rts.network.Start(t)
+	rts.network.Start(ctx, t)
 
-	t.Cleanup(func() {
-		for nodeID, r := range rts.reactors {
-			require.NoError(t, rts.states[nodeID].eventBus.Stop())
-			require.NoError(t, r.Stop())
-			require.False(t, r.IsRunning())
-		}
-
-		leaktest.Check(t)
-		cancel()
-	})
+	t.Cleanup(leaktest.Check(t))
 
 	return rts
 }
@@ -162,6 +174,7 @@ func validateBlock(block *types.Block, activeVals map[string]struct{}) error {
 }
 
 func waitForAndValidateBlock(
+	bctx context.Context,
 	t *testing.T,
 	n int,
 	activeVals map[string]struct{},
@@ -169,13 +182,21 @@ func waitForAndValidateBlock(
 	states []*State,
 	txs ...[]byte,
 ) {
+	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(bctx)
 	defer cancel()
+
 	fn := func(j int) {
 		msg, err := blocksSubs[j].Next(ctx)
-		if !assert.NoError(t, err) {
-			cancel()
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			return
+		case errors.Is(err, context.Canceled):
+			return
+		case err != nil:
+			cancel() // terminate other workers
+			require.NoError(t, err)
 			return
 		}
 
@@ -183,7 +204,11 @@ func waitForAndValidateBlock(
 		require.NoError(t, validateBlock(newBlock, activeVals))
 
 		for _, tx := range txs {
-			require.NoError(t, assertMempool(states[j].txNotifier).CheckTx(context.Background(), tx, nil, mempool.TxInfo{}))
+			err := assertMempool(t, states[j].txNotifier).CheckTx(ctx, tx, nil, mempool.TxInfo{})
+			if errors.Is(err, types.ErrTxInCache) {
+				continue
+			}
+			require.NoError(t, err)
 		}
 	}
 
@@ -197,9 +222,14 @@ func waitForAndValidateBlock(
 	}
 
 	wg.Wait()
+
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func waitForAndValidateBlockWithTx(
+	bctx context.Context,
 	t *testing.T,
 	n int,
 	activeVals map[string]struct{},
@@ -207,15 +237,22 @@ func waitForAndValidateBlockWithTx(
 	states []*State,
 	txs ...[]byte,
 ) {
+	t.Helper()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(bctx)
 	defer cancel()
 	fn := func(j int) {
 		ntxs := 0
 		for {
 			msg, err := blocksSubs[j].Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				cancel() // terminate other workers
+				t.Fatalf("problem waiting for %d subscription: %v", j, err)
 				return
 			}
 
@@ -246,25 +283,36 @@ func waitForAndValidateBlockWithTx(
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func waitForBlockWithUpdatedValsAndValidateIt(
+	bctx context.Context,
 	t *testing.T,
 	n int,
 	updatedVals map[string]struct{},
 	blocksSubs []eventbus.Subscription,
 	css []*State,
 ) {
-
-	ctx, cancel := context.WithCancel(context.Background())
+	t.Helper()
+	ctx, cancel := context.WithCancel(bctx)
 	defer cancel()
+
 	fn := func(j int) {
 		var newBlock *types.Block
 
 		for {
 			msg, err := blocksSubs[j].Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				cancel() // terminate other workers
+				t.Fatalf("problem waiting for %d subscription: %v", j, err)
 				return
 			}
 
@@ -287,6 +335,9 @@ func waitForBlockWithUpdatedValsAndValidateIt(
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
 }
 
 func ensureBlockSyncStatus(t *testing.T, msg tmpubsub.Message, complete bool, height int64) {
@@ -299,24 +350,27 @@ func ensureBlockSyncStatus(t *testing.T, msg tmpubsub.Message, complete bool, he
 }
 
 func TestReactorBasic(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(t,
+	n := 2
+	states, cleanup := makeConsensusState(ctx, t,
 		cfg, n, "consensus_reactor_test",
-		newMockTickerFunc(true), newKVStore)
+		newMockTickerFunc(true))
 	t.Cleanup(cleanup)
 
-	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
+	errCh := make(chan error, len(rts.subs))
+
 	for _, sub := range rts.subs {
 		wg.Add(1)
 
@@ -324,14 +378,32 @@ func TestReactorBasic(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			_, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				errCh <- err
+				cancel() // terminate other workers
+				return
 			}
 		}(sub)
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+	}
 
+	errCh = make(chan error, len(rts.blocksyncSubs))
 	for _, sub := range rts.blocksyncSubs {
 		wg.Add(1)
 
@@ -339,8 +411,14 @@ func TestReactorBasic(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			msg, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
-				cancel()
+			switch {
+			case errors.Is(err, context.DeadlineExceeded):
+				return
+			case errors.Is(err, context.Canceled):
+				return
+			case err != nil:
+				errCh <- err
+				cancel() // terminate other workers
 				return
 			}
 			ensureBlockSyncStatus(t, msg, true, 0)
@@ -348,17 +426,31 @@ func TestReactorBasic(t *testing.T) {
 	}
 
 	wg.Wait()
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	default:
+	}
 }
 
 func TestReactorWithEvidence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
-	n := 4
+	n := 2
 	testName := "consensus_reactor_test"
 	tickerFunc := newMockTickerFunc(true)
-	appFunc := newKVStore
 
-	genDoc, privVals := factory.RandGenesisDoc(cfg, n, false, 30)
+	valSet, privVals := factory.ValidatorSet(ctx, t, n, 30)
+	genDoc := factory.GenesisDoc(cfg, time.Now(), valSet.Validators, nil)
 	states := make([]*State, n)
 	logger := consensusLogger()
 
@@ -367,13 +459,13 @@ func TestReactorWithEvidence(t *testing.T) {
 		stateStore := sm.NewStore(stateDB)
 		state, err := sm.MakeGenesisState(genDoc)
 		require.NoError(t, err)
-		thisConfig, err := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
+		require.NoError(t, stateStore.Save(state))
+		thisConfig, err := ResetConfig(t.TempDir(), fmt.Sprintf("%s_%d", testName, i))
 		require.NoError(t, err)
 
 		defer os.RemoveAll(thisConfig.RootDir)
 
-		ensureDir(path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
-		app := appFunc()
+		app := kvstore.NewApplication()
 		vals := types.TM2PB.ValidatorUpdates(state.Validators)
 		app.InitChain(abci.RequestInitChain{Validators: vals})
 
@@ -382,15 +474,13 @@ func TestReactorWithEvidence(t *testing.T) {
 		blockStore := store.NewBlockStore(blockDB)
 
 		// one for mempool, one for consensus
-		mtx := new(tmsync.Mutex)
-		proxyAppConnMem := abciclient.NewLocalClient(mtx, app)
-		proxyAppConnCon := abciclient.NewLocalClient(mtx, app)
+		proxyAppConnMem := abciclient.NewLocalClient(logger, app)
+		proxyAppConnCon := abciclient.NewLocalClient(logger, app)
 
 		mempool := mempool.NewTxMempool(
-			log.TestingLogger().With("module", "mempool"),
+			log.NewNopLogger().With("module", "mempool"),
 			thisConfig.Mempool,
 			proxyAppConnMem,
-			0,
 		)
 
 		if thisConfig.Consensus.WaitForTxs() {
@@ -401,38 +491,38 @@ func TestReactorWithEvidence(t *testing.T) {
 		// everyone includes evidence of another double signing
 		vIdx := (i + 1) % n
 
-		ev := types.NewMockDuplicateVoteEvidenceWithValidator(1, defaultTestTime, privVals[vIdx], cfg.ChainID())
+		ev, err := types.NewMockDuplicateVoteEvidenceWithValidator(ctx, 1, defaultTestTime, privVals[vIdx], cfg.ChainID())
+		require.NoError(t, err)
 		evpool := &statemocks.EvidencePool{}
-		evpool.On("CheckEvidence", mock.AnythingOfType("types.EvidenceList")).Return(nil)
+		evpool.On("CheckEvidence", ctx, mock.AnythingOfType("types.EvidenceList")).Return(nil)
 		evpool.On("PendingEvidence", mock.AnythingOfType("int64")).Return([]types.Evidence{
 			ev}, int64(len(ev.Bytes())))
-		evpool.On("Update", mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
+		evpool.On("Update", ctx, mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
 
 		evpool2 := sm.EmptyEvidencePool{}
 
-		blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyAppConnCon, mempool, evpool, blockStore)
-		cs := NewState(logger.With("validator", i, "module", "consensus"),
-			thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool2)
-		cs.SetPrivValidator(pv)
+		eventBus := eventbus.NewDefault(log.NewNopLogger().With("module", "events"))
+		require.NoError(t, eventBus.Start(ctx))
 
-		eventBus := eventbus.NewDefault(log.TestingLogger().With("module", "events"))
-		require.NoError(t, eventBus.Start())
-		cs.SetEventBus(eventBus)
+		blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus)
+
+		cs, err := NewState(ctx, logger.With("validator", i, "module", "consensus"),
+			thisConfig.Consensus, stateStore, blockExec, blockStore, mempool, evpool2, eventBus)
+		require.NoError(t, err)
+		cs.SetPrivValidator(ctx, pv)
 
 		cs.SetTimeoutTicker(tickerFunc())
 
 		states[i] = cs
 	}
 
-	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, sub := range rts.subs {
 		wg.Add(1)
@@ -448,7 +538,7 @@ func TestReactorWithEvidence(t *testing.T) {
 			}
 
 			block := msg.Data().(types.EventDataNewBlock).Block
-			require.Len(t, block.Evidence.Evidence, 1)
+			require.Len(t, block.Evidence, 1)
 		}(sub)
 	}
 
@@ -456,43 +546,42 @@ func TestReactorWithEvidence(t *testing.T) {
 }
 
 func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(
+	n := 2
+	states, cleanup := makeConsensusState(ctx,
 		t,
 		cfg,
 		n,
 		"consensus_reactor_test",
 		newMockTickerFunc(true),
-		newKVStore,
 		func(c *config.Config) {
 			c.Consensus.CreateEmptyBlocks = false
 		},
 	)
-
 	t.Cleanup(cleanup)
 
-	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
 	// send a tx
 	require.NoError(
 		t,
-		assertMempool(states[3].txNotifier).CheckTx(
-			context.Background(),
+		assertMempool(t, states[1].txNotifier).CheckTx(
+			ctx,
 			[]byte{1, 2, 3},
 			nil,
 			mempool.TxInfo{},
 		),
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, sub := range rts.subs {
 		wg.Add(1)
@@ -511,23 +600,24 @@ func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
 }
 
 func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(t,
+	n := 2
+	states, cleanup := makeConsensusState(ctx, t,
 		cfg, n, "consensus_reactor_test",
-		newMockTickerFunc(true), newKVStore)
+		newMockTickerFunc(true))
 	t.Cleanup(cleanup)
 
-	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, sub := range rts.subs {
 		wg.Add(1)
@@ -575,39 +665,39 @@ func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
 }
 
 func TestReactorVotingPowerChange(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
-	n := 4
-	states, cleanup := randConsensusState(
+	n := 2
+	states, cleanup := makeConsensusState(ctx,
 		t,
 		cfg,
 		n,
 		"consensus_voting_power_changes_test",
 		newMockTickerFunc(true),
-		newPersistentKVStore,
 	)
 
 	t.Cleanup(cleanup)
 
-	rts := setup(t, n, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, n, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
 	// map of active validators
 	activeVals := make(map[string]struct{})
 	for i := 0; i < n; i++ {
-		pubKey, err := states[i].privValidator.GetPubKey(context.Background())
+		pubKey, err := states[i].privValidator.GetPubKey(ctx)
 		require.NoError(t, err)
 
 		addr := pubKey.Address()
 		activeVals[string(addr)] = struct{}{}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, sub := range rts.subs {
 		wg.Add(1)
@@ -629,7 +719,7 @@ func TestReactorVotingPowerChange(t *testing.T) {
 		blocksSubs = append(blocksSubs, sub)
 	}
 
-	val1PubKey, err := states[0].privValidator.GetPubKey(context.Background())
+	val1PubKey, err := states[0].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)
 
 	val1PubKeyABCI, err := encoding.PubKeyToProto(val1PubKey)
@@ -638,10 +728,10 @@ func TestReactorVotingPowerChange(t *testing.T) {
 	updateValidatorTx := kvstore.MakeValSetChangeTx(val1PubKeyABCI, 25)
 	previousTotalVotingPower := states[0].GetRoundState().LastValidators.TotalVotingPower()
 
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlockWithTx(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlockWithTx(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
 
 	require.NotEqualf(
 		t, previousTotalVotingPower, states[0].GetRoundState().LastValidators.TotalVotingPower(),
@@ -653,10 +743,10 @@ func TestReactorVotingPowerChange(t *testing.T) {
 	updateValidatorTx = kvstore.MakeValSetChangeTx(val1PubKeyABCI, 2)
 	previousTotalVotingPower = states[0].GetRoundState().LastValidators.TotalVotingPower()
 
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlockWithTx(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlockWithTx(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
 
 	require.NotEqualf(
 		t, states[0].GetRoundState().LastValidators.TotalVotingPower(), previousTotalVotingPower,
@@ -667,10 +757,10 @@ func TestReactorVotingPowerChange(t *testing.T) {
 	updateValidatorTx = kvstore.MakeValSetChangeTx(val1PubKeyABCI, 26)
 	previousTotalVotingPower = states[0].GetRoundState().LastValidators.TotalVotingPower()
 
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlockWithTx(t, n, activeVals, blocksSubs, states, updateValidatorTx)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
-	waitForAndValidateBlock(t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlockWithTx(ctx, t, n, activeVals, blocksSubs, states, updateValidatorTx)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, n, activeVals, blocksSubs, states)
 
 	require.NotEqualf(
 		t, previousTotalVotingPower, states[0].GetRoundState().LastValidators.TotalVotingPower(),
@@ -681,38 +771,41 @@ func TestReactorVotingPowerChange(t *testing.T) {
 }
 
 func TestReactorValidatorSetChanges(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
 	cfg := configSetup(t)
 
 	nPeers := 7
 	nVals := 4
 	states, _, _, cleanup := randConsensusNetWithPeers(
+		ctx,
+		t,
 		cfg,
 		nVals,
 		nPeers,
 		"consensus_val_set_changes_test",
 		newMockTickerFunc(true),
-		newPersistentKVStoreWithPath,
+		newEpehemeralKVStore,
 	)
 	t.Cleanup(cleanup)
 
-	rts := setup(t, nPeers, states, 100) // buffer must be large enough to not deadlock
+	rts := setup(ctx, t, nPeers, states, 100) // buffer must be large enough to not deadlock
 
 	for _, reactor := range rts.reactors {
 		state := reactor.state.GetState()
-		reactor.SwitchToConsensus(state, false)
+		reactor.SwitchToConsensus(ctx, state, false)
 	}
 
 	// map of active validators
 	activeVals := make(map[string]struct{})
 	for i := 0; i < nVals; i++ {
-		pubKey, err := states[i].privValidator.GetPubKey(context.Background())
+		pubKey, err := states[i].privValidator.GetPubKey(ctx)
 		require.NoError(t, err)
 
 		activeVals[string(pubKey.Address())] = struct{}{}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	var wg sync.WaitGroup
 	for _, sub := range rts.subs {
 		wg.Add(1)
@@ -721,7 +814,11 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 		go func(s eventbus.Subscription) {
 			defer wg.Done()
 			_, err := s.Next(ctx)
-			if !assert.NoError(t, err) {
+			switch {
+			case err == nil:
+			case errors.Is(err, context.DeadlineExceeded):
+			default:
+				t.Log(err)
 				cancel()
 			}
 		}(sub)
@@ -729,7 +826,18 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 
 	wg.Wait()
 
-	newValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(context.Background())
+	// after the wait returns, either there was an error with a
+	// subscription (very unlikely, and causes the context to be
+	// canceled manually), there was a timeout and the test's root context
+	// was canceled (somewhat likely,) or the test can proceed
+	// (common.)
+	if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("encountered timeout")
+	} else if errors.Is(err, context.Canceled) {
+		t.Fatal("subscription encountered unexpected error")
+	}
+
+	newValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)
 
 	valPubKey1ABCI, err := encoding.PubKeyToProto(newValidatorPubKey1)
@@ -745,24 +853,24 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	// wait till everyone makes block 2
 	// ensure the commit includes all validators
 	// send newValTx to change vals in block 3
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states, newValidatorTx1)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx1)
 
 	// wait till everyone makes block 3.
 	// it includes the commit for block 2, which is by the original validator set
-	waitForAndValidateBlockWithTx(t, nPeers, activeVals, blocksSubs, states, newValidatorTx1)
+	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx1)
 
 	// wait till everyone makes block 4.
 	// it includes the commit for block 3, which is by the original validator set
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
 
 	// the commits for block 4 should be with the updated validator set
 	activeVals[string(newValidatorPubKey1.Address())] = struct{}{}
 
 	// wait till everyone makes block 5
 	// it includes the commit for block 4, which should have the updated validator set
-	waitForBlockWithUpdatedValsAndValidateIt(t, nPeers, activeVals, blocksSubs, states)
+	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 
-	updateValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(context.Background())
+	updateValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)
 
 	updatePubKey1ABCI, err := encoding.PubKeyToProto(updateValidatorPubKey1)
@@ -771,10 +879,10 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	updateValidatorTx1 := kvstore.MakeValSetChangeTx(updatePubKey1ABCI, 25)
 	previousTotalVotingPower := states[nVals].GetRoundState().LastValidators.TotalVotingPower()
 
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
-	waitForAndValidateBlockWithTx(t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states)
-	waitForBlockWithUpdatedValsAndValidateIt(t, nPeers, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
+	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
+	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 
 	require.NotEqualf(
 		t, states[nVals].GetRoundState().LastValidators.TotalVotingPower(), previousTotalVotingPower,
@@ -782,7 +890,7 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 		previousTotalVotingPower, states[nVals].GetRoundState().LastValidators.TotalVotingPower(),
 	)
 
-	newValidatorPubKey2, err := states[nVals+1].privValidator.GetPubKey(context.Background())
+	newValidatorPubKey2, err := states[nVals+1].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)
 
 	newVal2ABCI, err := encoding.PubKeyToProto(newValidatorPubKey2)
@@ -790,7 +898,7 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 
 	newValidatorTx2 := kvstore.MakeValSetChangeTx(newVal2ABCI, testMinPower)
 
-	newValidatorPubKey3, err := states[nVals+2].privValidator.GetPubKey(context.Background())
+	newValidatorPubKey3, err := states[nVals+2].privValidator.GetPubKey(ctx)
 	require.NoError(t, err)
 
 	newVal3ABCI, err := encoding.PubKeyToProto(newValidatorPubKey3)
@@ -798,24 +906,24 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 
 	newValidatorTx3 := kvstore.MakeValSetChangeTx(newVal3ABCI, testMinPower)
 
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
-	waitForAndValidateBlockWithTx(t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
+	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
 
 	activeVals[string(newValidatorPubKey2.Address())] = struct{}{}
 	activeVals[string(newValidatorPubKey3.Address())] = struct{}{}
 
-	waitForBlockWithUpdatedValsAndValidateIt(t, nPeers, activeVals, blocksSubs, states)
+	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 
 	removeValidatorTx2 := kvstore.MakeValSetChangeTx(newVal2ABCI, 0)
 	removeValidatorTx3 := kvstore.MakeValSetChangeTx(newVal3ABCI, 0)
 
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
-	waitForAndValidateBlockWithTx(t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
-	waitForAndValidateBlock(t, nPeers, activeVals, blocksSubs, states)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
+	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
+	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
 
 	delete(activeVals, string(newValidatorPubKey2.Address()))
 	delete(activeVals, string(newValidatorPubKey3.Address()))
 
-	waitForBlockWithUpdatedValsAndValidateIt(t, nPeers, activeVals, blocksSubs, states)
+	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 }

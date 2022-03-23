@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"math"
@@ -24,6 +25,9 @@ import (
 )
 
 func TestMsgToProto(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	psh := types.PartSetHeader{
 		Total: 1,
 		Hash:  tmrand.Bytes(32),
@@ -62,7 +66,7 @@ func TestMsgToProto(t *testing.T) {
 	pbProposal := proposal.ToProto()
 
 	pv := types.NewMockPV()
-	vote, err := factory.MakeVote(pv, factory.DefaultTestChainID,
+	vote, err := factory.MakeVote(ctx, pv, factory.DefaultTestChainID,
 		0, 1, 0, 2, types.BlockID{}, time.Now())
 	require.NoError(t, err)
 	pbVote := vote.ToProto()
@@ -313,7 +317,6 @@ func TestWALMsgProto(t *testing.T) {
 	}
 }
 
-// nolint:lll //ignore line length for tests
 func TestConsMsgsVectors(t *testing.T) {
 	date := time.Date(2018, 8, 30, 12, 0, 0, 0, time.UTC)
 	psh := types.PartSetHeader{
@@ -354,6 +357,11 @@ func TestConsMsgsVectors(t *testing.T) {
 	}
 	pbProposal := proposal.ToProto()
 
+	ext := types.VoteExtension{
+		AppDataToSign:             []byte("signed"),
+		AppDataSelfAuthenticating: []byte("auth"),
+	}
+
 	v := &types.Vote{
 		ValidatorAddress: []byte("add_more_exclamation"),
 		ValidatorIndex:   1,
@@ -362,6 +370,7 @@ func TestConsMsgsVectors(t *testing.T) {
 		Timestamp:        date,
 		Type:             tmproto.PrecommitType,
 		BlockID:          bi,
+		VoteExtension:    ext,
 	}
 	vpb := v.ToProto()
 
@@ -398,7 +407,7 @@ func TestConsMsgsVectors(t *testing.T) {
 			"2a36080110011a3008011204746573741a26080110011a206164645f6d6f72655f6578636c616d6174696f6e5f6d61726b735f636f64652d"},
 		{"Vote", &tmcons.Message{Sum: &tmcons.Message_Vote{
 			Vote: &tmcons.Vote{Vote: vpb}}},
-			"32700a6e0802100122480a206164645f6d6f72655f6578636c616d6174696f6e5f6d61726b735f636f64652d1224080112206164645f6d6f72655f6578636c616d6174696f6e5f6d61726b735f636f64652d2a0608c0b89fdc0532146164645f6d6f72655f6578636c616d6174696f6e3801"},
+			"3280010a7e0802100122480a206164645f6d6f72655f6578636c616d6174696f6e5f6d61726b735f636f64652d1224080112206164645f6d6f72655f6578636c616d6174696f6e5f6d61726b735f636f64652d2a0608c0b89fdc0532146164645f6d6f72655f6578636c616d6174696f6e38014a0e0a067369676e6564120461757468"},
 		{"HasVote", &tmcons.Message{Sum: &tmcons.Message_HasVote{
 			HasVote: &tmcons.HasVote{Height: 1, Round: 1, Type: tmproto.PrevoteType, Index: 1}}},
 			"3a080801100118012001"},

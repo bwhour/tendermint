@@ -19,6 +19,7 @@ import (
 
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/crypto/ed25519"
+	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/privval"
 	e2e "github.com/tendermint/tendermint/test/e2e/pkg"
 	"github.com/tendermint/tendermint/types"
@@ -38,7 +39,7 @@ const (
 )
 
 // Setup sets up the testnet configuration.
-func Setup(testnet *e2e.Testnet) error {
+func Setup(logger log.Logger, testnet *e2e.Testnet) error {
 	logger.Info(fmt.Sprintf("Generating testnet files in %q", testnet.Dir))
 
 	err := os.MkdirAll(testnet.Dir, os.ModePerm)
@@ -111,17 +112,23 @@ func Setup(testnet *e2e.Testnet) error {
 			return err
 		}
 
-		(privval.NewFilePV(node.PrivvalKey,
+		err = (privval.NewFilePV(node.PrivvalKey,
 			filepath.Join(nodeDir, PrivvalKeyFile),
 			filepath.Join(nodeDir, PrivvalStateFile),
 		)).Save()
+		if err != nil {
+			return err
+		}
 
 		// Set up a dummy validator. Tendermint requires a file PV even when not used, so we
 		// give it a dummy such that it will fail if it actually tries to use it.
-		(privval.NewFilePV(ed25519.GenPrivKey(),
+		err = (privval.NewFilePV(ed25519.GenPrivKey(),
 			filepath.Join(nodeDir, PrivvalDummyKeyFile),
 			filepath.Join(nodeDir, PrivvalDummyStateFile),
 		)).Save()
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -310,12 +317,12 @@ func MakeConfig(node *e2e.Node) (*config.Config, error) {
 		}
 	}
 
-	cfg.P2P.Seeds = ""
+	cfg.P2P.Seeds = "" //nolint: staticcheck
 	for _, seed := range node.Seeds {
-		if len(cfg.P2P.Seeds) > 0 {
-			cfg.P2P.Seeds += ","
+		if len(cfg.P2P.Seeds) > 0 { //nolint: staticcheck
+			cfg.P2P.Seeds += "," //nolint: staticcheck
 		}
-		cfg.P2P.Seeds += seed.AddressP2P(true)
+		cfg.P2P.Seeds += seed.AddressP2P(true) //nolint: staticcheck
 	}
 
 	cfg.P2P.PersistentPeers = ""

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -13,7 +14,7 @@ import (
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/tmhash"
 	"github.com/tendermint/tendermint/internal/test/factory"
-	tmjson "github.com/tendermint/tendermint/libs/json"
+	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/privval"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	e2e "github.com/tendermint/tendermint/test/e2e/pkg"
@@ -28,7 +29,7 @@ const lightClientEvidenceRatio = 4
 // evidence and broadcasts it to a random node through the rpc endpoint `/broadcast_evidence`.
 // Evidence is random and can be a mixture of LightClientAttackEvidence and
 // DuplicateVoteEvidence.
-func InjectEvidence(ctx context.Context, r *rand.Rand, testnet *e2e.Testnet, amount int) error {
+func InjectEvidence(ctx context.Context, logger log.Logger, r *rand.Rand, testnet *e2e.Testnet, amount int) error {
 	// select a random node
 	var targetNode *e2e.Node
 
@@ -83,11 +84,11 @@ func InjectEvidence(ctx context.Context, r *rand.Rand, testnet *e2e.Testnet, amo
 	var ev types.Evidence
 	for i := 1; i <= amount; i++ {
 		if i%lightClientEvidenceRatio == 0 {
-			ev, err = generateLightClientAttackEvidence(
+			ev, err = generateLightClientAttackEvidence(ctx,
 				privVals, evidenceHeight, valSet, testnet.Name, blockRes.Block.Time,
 			)
 		} else {
-			ev, err = generateDuplicateVoteEvidence(
+			ev, err = generateDuplicateVoteEvidence(ctx,
 				privVals, evidenceHeight, valSet, testnet.Name, blockRes.Block.Time,
 			)
 		}
@@ -112,7 +113,7 @@ func InjectEvidence(ctx context.Context, r *rand.Rand, testnet *e2e.Testnet, amo
 
 	// wait for the node to make progress after submitting
 	// evidence (3 (forged height) + 1 (progress))
-	_, err = waitForNode(wctx, targetNode, evidenceHeight+4)
+	_, err = waitForNode(wctx, logger, targetNode, evidenceHeight+4)
 	if err != nil {
 		return err
 	}
@@ -142,6 +143,7 @@ func getPrivateValidatorKeys(testnet *e2e.Testnet) ([]types.MockPV, error) {
 // creates evidence of a lunatic attack. The height provided is the common height.
 // The forged height happens 2 blocks later.
 func generateLightClientAttackEvidence(
+	ctx context.Context,
 	privVals []types.MockPV,
 	height int64,
 	vals *types.ValidatorSet,
@@ -156,7 +158,7 @@ func generateLightClientAttackEvidence(
 
 	// add a new bogus validator and remove an existing one to
 	// vary the validator set slightly
-	pv, conflictingVals, err := mutateValidatorSet(privVals, vals)
+	pv, conflictingVals, err := mutateValidatorSet(ctx, privVals, vals)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +168,8 @@ func generateLightClientAttackEvidence(
 	// create a commit for the forged header
 	blockID := makeBlockID(header.Hash(), 1000, []byte("partshash"))
 	voteSet := types.NewVoteSet(chainID, forgedHeight, 0, tmproto.SignedMsgType(2), conflictingVals)
-	commit, err := factory.MakeCommit(blockID, forgedHeight, 0, voteSet, pv, forgedTime)
+
+	commit, err := factory.MakeCommit(ctx, blockID, forgedHeight, 0, voteSet, pv, forgedTime)
 	if err != nil {
 		return nil, err
 	}
@@ -192,6 +195,7 @@ func generateLightClientAttackEvidence(
 // generateDuplicateVoteEvidence picks a random validator from the val set and
 // returns duplicate vote evidence against the validator
 func generateDuplicateVoteEvidence(
+	ctx context.Context,
 	privVals []types.MockPV,
 	height int64,
 	vals *types.ValidatorSet,
@@ -202,11 +206,12 @@ func generateDuplicateVoteEvidence(
 	if err != nil {
 		return nil, err
 	}
-	voteA, err := factory.MakeVote(privVal, chainID, valIdx, height, 0, 2, makeRandomBlockID(), time)
+
+	voteA, err := factory.MakeVote(ctx, privVal, chainID, valIdx, height, 0, 2, makeRandomBlockID(), time)
 	if err != nil {
 		return nil, err
 	}
-	voteB, err := factory.MakeVote(privVal, chainID, valIdx, height, 0, 2, makeRandomBlockID(), time)
+	voteB, err := factory.MakeVote(ctx, privVal, chainID, valIdx, height, 0, 2, makeRandomBlockID(), time)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +242,7 @@ func readPrivKey(keyFilePath string) (crypto.PrivKey, error) {
 		return nil, err
 	}
 	pvKey := privval.FilePVKey{}
-	err = tmjson.Unmarshal(keyJSONBytes, &pvKey)
+	err = json.Unmarshal(keyJSONBytes, &pvKey)
 	if err != nil {
 		return nil, fmt.Errorf("error reading PrivValidator key from %v: %w", keyFilePath, err)
 	}
@@ -284,9 +289,12 @@ func makeBlockID(hash []byte, partSetSize uint32, partSetHash []byte) types.Bloc
 	}
 }
 
-func mutateValidatorSet(privVals []types.MockPV, vals *types.ValidatorSet,
+func mutateValidatorSet(ctx context.Context, privVals []types.MockPV, vals *types.ValidatorSet,
 ) ([]types.PrivValidator, *types.ValidatorSet, error) {
-	newVal, newPrivVal := factory.RandValidator(false, 10)
+	newVal, newPrivVal, err := factory.Validator(ctx, 10)
+	if err != nil {
+		return nil, nil, err
+	}
 
 	var newVals *types.ValidatorSet
 	if vals.Size() > 2 {

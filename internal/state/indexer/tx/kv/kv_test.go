@@ -3,7 +3,6 @@ package kv
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
@@ -12,8 +11,8 @@ import (
 	dbm "github.com/tendermint/tm-db"
 
 	abci "github.com/tendermint/tendermint/abci/types"
+	"github.com/tendermint/tendermint/internal/pubsub/query"
 	"github.com/tendermint/tendermint/internal/state/indexer"
-	"github.com/tendermint/tendermint/libs/pubsub/query"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	"github.com/tendermint/tendermint/types"
 )
@@ -26,7 +25,7 @@ func TestTxIndex(t *testing.T) {
 		Height: 1,
 		Index:  0,
 		Tx:     tx,
-		Result: abci.ResponseDeliverTx{
+		Result: abci.ExecTxResult{
 			Data: []byte{0},
 			Code: abci.CodeTypeOK, Log: "", Events: nil,
 		},
@@ -49,7 +48,7 @@ func TestTxIndex(t *testing.T) {
 		Height: 1,
 		Index:  0,
 		Tx:     tx2,
-		Result: abci.ResponseDeliverTx{
+		Result: abci.ExecTxResult{
 			Data: []byte{0},
 			Code: abci.CodeTypeOK, Log: "", Events: nil,
 		},
@@ -131,7 +130,7 @@ func TestTxSearch(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustParse(tc.q))
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -157,7 +156,7 @@ func TestTxSearchWithCancelation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	results, err := indexer.Search(ctx, query.MustParse("account.number = 1"))
+	results, err := indexer.Search(ctx, query.MustCompile(`account.number = 1`))
 	assert.NoError(t, err)
 	assert.Empty(t, results)
 }
@@ -230,7 +229,7 @@ func TestTxSearchDeprecatedIndexing(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustParse(tc.q))
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			require.NoError(t, err)
 			for _, txr := range results {
 				for _, tr := range tc.results {
@@ -254,7 +253,7 @@ func TestTxSearchOneTxWithMultipleSameTagsButDifferentValues(t *testing.T) {
 
 	ctx := context.Background()
 
-	results, err := indexer.Search(ctx, query.MustParse("account.number >= 1"))
+	results, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`))
 	assert.NoError(t, err)
 
 	assert.Len(t, results, 1)
@@ -311,7 +310,7 @@ func TestTxSearchMultipleTxs(t *testing.T) {
 
 	ctx := context.Background()
 
-	results, err := indexer.Search(ctx, query.MustParse("account.number >= 1"))
+	results, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`))
 	assert.NoError(t, err)
 
 	require.Len(t, results, 3)
@@ -323,7 +322,7 @@ func txResultWithEvents(events []abci.Event) *abci.TxResult {
 		Height: 1,
 		Index:  0,
 		Tx:     tx,
-		Result: abci.ResponseDeliverTx{
+		Result: abci.ExecTxResult{
 			Data:   []byte{0},
 			Code:   abci.CodeTypeOK,
 			Log:    "",
@@ -333,9 +332,7 @@ func txResultWithEvents(events []abci.Event) *abci.TxResult {
 }
 
 func benchmarkTxIndex(txsCount int64, b *testing.B) {
-	dir, err := os.MkdirTemp("", "tx_index_db")
-	require.NoError(b, err)
-	defer os.RemoveAll(dir)
+	dir := b.TempDir()
 
 	store, err := dbm.NewDB("tx_index", "goleveldb", dir)
 	require.NoError(b, err)
@@ -349,7 +346,7 @@ func benchmarkTxIndex(txsCount int64, b *testing.B) {
 			Height: 1,
 			Index:  txIndex,
 			Tx:     tx,
-			Result: abci.ResponseDeliverTx{
+			Result: abci.ExecTxResult{
 				Data:   []byte{0},
 				Code:   abci.CodeTypeOK,
 				Log:    "",

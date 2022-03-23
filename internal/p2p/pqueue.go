@@ -2,12 +2,14 @@ package p2p
 
 import (
 	"container/heap"
+	"context"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
+
 	"github.com/tendermint/tendermint/libs/log"
 )
 
@@ -77,8 +79,10 @@ type pqScheduler struct {
 
 	enqueueCh chan Envelope
 	dequeueCh chan Envelope
-	closer    *tmsync.Closer
-	done      *tmsync.Closer
+
+	closeFn func()
+	closeCh <-chan struct{}
+	done    chan struct{}
 }
 
 func newPQScheduler(
@@ -107,6 +111,9 @@ func newPQScheduler(
 	pq := make(priorityQueue, 0)
 	heap.Init(&pq)
 
+	closeCh := make(chan struct{})
+	once := &sync.Once{}
+
 	return &pqScheduler{
 		logger:       logger.With("router", "scheduler"),
 		metrics:      m,
@@ -117,32 +124,18 @@ func newPQScheduler(
 		sizes:        sizes,
 		enqueueCh:    make(chan Envelope, enqueueBuf),
 		dequeueCh:    make(chan Envelope, dequeueBuf),
-		closer:       tmsync.NewCloser(),
-		done:         tmsync.NewCloser(),
+		closeFn:      func() { once.Do(func() { close(closeCh) }) },
+		closeCh:      closeCh,
+		done:         make(chan struct{}),
 	}
 }
 
-func (s *pqScheduler) enqueue() chan<- Envelope {
-	return s.enqueueCh
-}
-
-func (s *pqScheduler) dequeue() <-chan Envelope {
-	return s.dequeueCh
-}
-
-func (s *pqScheduler) close() {
-	s.closer.Close()
-	<-s.done.Done()
-}
-
-func (s *pqScheduler) closed() <-chan struct{} {
-	return s.closer.Done()
-}
-
 // start starts non-blocking process that starts the priority queue scheduler.
-func (s *pqScheduler) start() {
-	go s.process()
-}
+func (s *pqScheduler) start(ctx context.Context) { go s.process(ctx) }
+func (s *pqScheduler) enqueue() chan<- Envelope  { return s.enqueueCh }
+func (s *pqScheduler) dequeue() <-chan Envelope  { return s.dequeueCh }
+func (s *pqScheduler) close()                    { s.closeFn() }
+func (s *pqScheduler) closed() <-chan struct{}   { return s.done }
 
 // process starts a block process where we listen for Envelopes to enqueue. If
 // there is sufficient capacity, it will be enqueued into the priority queue,
@@ -153,17 +146,17 @@ func (s *pqScheduler) start() {
 //
 // After we attempt to enqueue the incoming Envelope, if the priority queue is
 // non-empty, we pop the top Envelope and send it on the dequeueCh.
-func (s *pqScheduler) process() {
-	defer s.done.Close()
+func (s *pqScheduler) process(ctx context.Context) {
+	defer close(s.done)
 
 	for {
 		select {
 		case e := <-s.enqueueCh:
-			chIDStr := strconv.Itoa(int(e.channelID))
+			chIDStr := strconv.Itoa(int(e.ChannelID))
 			pqEnv := &pqEnvelope{
 				envelope:  e,
 				size:      uint(proto.Size(e.Message)),
-				priority:  s.chPriorities[e.channelID],
+				priority:  s.chPriorities[e.ChannelID],
 				timestamp: time.Now().UTC(),
 			}
 
@@ -202,7 +195,7 @@ func (s *pqScheduler) process() {
 							if tmpSize+pqEnv.size <= s.capacity {
 								canEnqueue = true
 							} else {
-								pqEnvTmpChIDStr := strconv.Itoa(int(pqEnvTmp.envelope.channelID))
+								pqEnvTmpChIDStr := strconv.Itoa(int(pqEnvTmp.envelope.ChannelID))
 								s.metrics.PeerQueueDroppedMsgs.With("ch_id", pqEnvTmpChIDStr).Add(1)
 								s.logger.Debug(
 									"dropped envelope",
@@ -263,19 +256,20 @@ func (s *pqScheduler) process() {
 					"peer_id", string(pqEnv.envelope.To)).Add(float64(-pqEnv.size))
 				select {
 				case s.dequeueCh <- pqEnv.envelope:
-				case <-s.closer.Done():
+				case <-s.closeCh:
 					return
 				}
 			}
-
-		case <-s.closer.Done():
+		case <-ctx.Done():
+			return
+		case <-s.closeCh:
 			return
 		}
 	}
 }
 
 func (s *pqScheduler) push(pqEnv *pqEnvelope) {
-	chIDStr := strconv.Itoa(int(pqEnv.envelope.channelID))
+	chIDStr := strconv.Itoa(int(pqEnv.envelope.ChannelID))
 
 	// enqueue the incoming Envelope
 	heap.Push(s.pq, pqEnv)

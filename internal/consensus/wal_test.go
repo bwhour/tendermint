@@ -2,11 +2,14 @@ package consensus
 
 import (
 	"bytes"
+	"context"
+	"os"
 	"path/filepath"
 
 	"testing"
 	"time"
 
+	"github.com/fortytw2/leaktest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -18,40 +21,37 @@ import (
 	tmtypes "github.com/tendermint/tendermint/types"
 )
 
-const (
-	walTestFlushInterval = time.Duration(100) * time.Millisecond
-)
+const walTestFlushInterval = 100 * time.Millisecond
 
 func TestWALTruncate(t *testing.T) {
 	walDir := t.TempDir()
 	walFile := filepath.Join(walDir, "wal")
-	logger := log.TestingLogger()
+	logger := log.NewNopLogger()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// this magic number 4K can truncate the content when RotateFile.
 	// defaultHeadSizeLimit(10M) is hard to simulate.
 	// this magic number 1 * time.Millisecond make RotateFile check frequently.
 	// defaultGroupCheckDuration(5s) is hard to simulate.
-	wal, err := NewWAL(logger, walFile,
+	wal, err := NewWAL(ctx, logger, walFile,
 		autofile.GroupHeadSizeLimit(4096),
 		autofile.GroupCheckDuration(1*time.Millisecond),
 	)
 	require.NoError(t, err)
-	err = wal.Start()
+	err = wal.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := wal.Stop(); err != nil {
-			t.Error(err)
-		}
-		// wait for the wal to finish shutting down so we
-		// can safely remove the directory
-		wal.Wait()
-	})
+	t.Cleanup(func() { wal.Stop(); wal.Group().Stop(); wal.Group().Wait(); wal.Wait() })
 
 	// 60 block's size nearly 70K, greater than group's headBuf size(4096 * 10),
 	// when headBuf is full, truncate content will Flush to the file. at this
 	// time, RotateFile is called, truncate content exist in each file.
-	err = WALGenerateNBlocks(t, wal.Group(), 60)
-	require.NoError(t, err)
+	WALGenerateNBlocks(ctx, t, logger, wal.Group(), 60)
+
+	// put the leakcheck here so it runs after other cleanup
+	// functions.
+	t.Cleanup(leaktest.CheckTimeout(t, 500*time.Millisecond))
 
 	time.Sleep(1 * time.Millisecond) // wait groupCheckDuration, make sure RotateFile run
 
@@ -105,18 +105,14 @@ func TestWALWrite(t *testing.T) {
 	walDir := t.TempDir()
 	walFile := filepath.Join(walDir, "wal")
 
-	wal, err := NewWAL(log.TestingLogger(), walFile)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wal, err := NewWAL(ctx, log.NewNopLogger(), walFile)
 	require.NoError(t, err)
-	err = wal.Start()
+	err = wal.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := wal.Stop(); err != nil {
-			t.Error(err)
-		}
-		// wait for the wal to finish shutting down so we
-		// can safely remove the directory
-		wal.Wait()
-	})
+	t.Cleanup(func() { wal.Stop(); wal.Group().Stop(); wal.Group().Wait(); wal.Wait() })
 
 	// 1) Write returns an error if msg is too big
 	msg := &BlockPartMessage{
@@ -142,13 +138,18 @@ func TestWALWrite(t *testing.T) {
 }
 
 func TestWALSearchForEndHeight(t *testing.T) {
-	walBody, err := WALWithNBlocks(t, 6)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := log.NewNopLogger()
+
+	walBody, err := WALWithNBlocks(ctx, t, logger, 6)
 	if err != nil {
 		t.Fatal(err)
 	}
-	walFile := tempWALWithData(walBody)
+	walFile := tempWALWithData(t, walBody)
 
-	wal, err := NewWAL(log.TestingLogger(), walFile)
+	wal, err := NewWAL(ctx, logger, walFile)
 	require.NoError(t, err)
 
 	h := int64(3)
@@ -164,33 +165,34 @@ func TestWALSearchForEndHeight(t *testing.T) {
 	rs, ok := msg.Msg.(tmtypes.EventDataRoundState)
 	assert.True(t, ok, "expected message of type EventDataRoundState")
 	assert.Equal(t, rs.Height, h+1, "wrong height")
+
+	t.Cleanup(leaktest.Check(t))
 }
 
 func TestWALPeriodicSync(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	walDir := t.TempDir()
 	walFile := filepath.Join(walDir, "wal")
-	wal, err := NewWAL(log.TestingLogger(), walFile, autofile.GroupCheckDuration(1*time.Millisecond))
+	defer os.RemoveAll(walFile)
 
+	wal, err := NewWAL(ctx, log.NewNopLogger(), walFile, autofile.GroupCheckDuration(250*time.Millisecond))
 	require.NoError(t, err)
 
 	wal.SetFlushInterval(walTestFlushInterval)
+	logger := log.NewNopLogger()
 
 	// Generate some data
-	err = WALGenerateNBlocks(t, wal.Group(), 5)
-	require.NoError(t, err)
+	WALGenerateNBlocks(ctx, t, logger, wal.Group(), 5)
 
 	// We should have data in the buffer now
 	assert.NotZero(t, wal.Group().Buffered())
 
-	require.NoError(t, wal.Start())
-	t.Cleanup(func() {
-		if err := wal.Stop(); err != nil {
-			t.Error(err)
-		}
-		wal.Wait()
-	})
+	require.NoError(t, wal.Start(ctx))
+	t.Cleanup(func() { wal.Stop(); wal.Group().Stop(); wal.Group().Wait(); wal.Wait() })
 
-	time.Sleep(walTestFlushInterval + (10 * time.Millisecond))
+	time.Sleep(walTestFlushInterval + (20 * time.Millisecond))
 
 	// The data should have been flushed by the periodic sync
 	assert.Zero(t, wal.Group().Buffered())
@@ -203,4 +205,6 @@ func TestWALPeriodicSync(t *testing.T) {
 	if gr != nil {
 		gr.Close()
 	}
+
+	t.Cleanup(leaktest.Check(t))
 }

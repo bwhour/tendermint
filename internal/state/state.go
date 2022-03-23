@@ -9,6 +9,8 @@ import (
 
 	"github.com/gogo/protobuf/proto"
 
+	tmtime "github.com/tendermint/tendermint/libs/time"
+
 	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
 	tmversion "github.com/tendermint/tendermint/proto/tendermint/version"
 	"github.com/tendermint/tendermint/types"
@@ -89,7 +91,7 @@ type State struct {
 	LastHeightValidatorsChanged int64
 
 	// Consensus parameters used for validating blocks.
-	// Changes returned by EndBlock and updated after Commit.
+	// Changes returned by FinalizeBlock and updated after Commit.
 	ConsensusParams                  types.ConsensusParams
 	LastHeightConsensusParamsChanged int64
 
@@ -127,23 +129,30 @@ func (state State) Copy() State {
 }
 
 // Equals returns true if the States are identical.
-func (state State) Equals(state2 State) bool {
-	sbz, s2bz := state.Bytes(), state2.Bytes()
-	return bytes.Equal(sbz, s2bz)
+func (state State) Equals(state2 State) (bool, error) {
+	sbz, err := state.Bytes()
+	if err != nil {
+		return false, err
+	}
+	s2bz, err := state2.Bytes()
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(sbz, s2bz), nil
 }
 
-// Bytes serializes the State using protobuf.
-// It panics if either casting to protobuf or serialization fails.
-func (state State) Bytes() []byte {
+// Bytes serializes the State using protobuf, propagating marshaling
+// errors
+func (state State) Bytes() ([]byte, error) {
 	sm, err := state.ToProto()
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
 	bz, err := proto.Marshal(sm)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
-	return bz
+	return bz, nil
 }
 
 // IsEmpty returns true if the State is equal to the empty State.
@@ -258,52 +267,21 @@ func (state State) MakeBlock(
 	commit *types.Commit,
 	evidence []types.Evidence,
 	proposerAddress []byte,
-) (*types.Block, *types.PartSet) {
+) *types.Block {
 
 	// Build base block with block data.
 	block := types.MakeBlock(height, txs, commit, evidence)
 
-	// Set time.
-	var timestamp time.Time
-	if height == state.InitialHeight {
-		timestamp = state.LastBlockTime // genesis time
-	} else {
-		timestamp = MedianTime(commit, state.LastValidators)
-	}
-
 	// Fill rest of header with state data.
 	block.Header.Populate(
 		state.Version.Consensus, state.ChainID,
-		timestamp, state.LastBlockID,
+		tmtime.Now(), state.LastBlockID,
 		state.Validators.Hash(), state.NextValidators.Hash(),
 		state.ConsensusParams.HashConsensusParams(), state.AppHash, state.LastResultsHash,
 		proposerAddress,
 	)
 
-	return block, block.MakePartSet(types.BlockPartSizeBytes)
-}
-
-// MedianTime computes a median time for a given Commit (based on Timestamp field of votes messages) and the
-// corresponding validator set. The computed time is always between timestamps of
-// the votes sent by honest processes, i.e., a faulty processes can not arbitrarily increase or decrease the
-// computed value.
-func MedianTime(commit *types.Commit, validators *types.ValidatorSet) time.Time {
-	weightedTimes := make([]*weightedTime, len(commit.Signatures))
-	totalVotingPower := int64(0)
-
-	for i, commitSig := range commit.Signatures {
-		if commitSig.Absent() {
-			continue
-		}
-		_, validator := validators.GetByAddress(commitSig.ValidatorAddress)
-		// If there's no condition, TestValidateBlockCommit panics; not needed normally.
-		if validator != nil {
-			totalVotingPower += validator.VotingPower
-			weightedTimes[i] = newWeightedTime(commitSig.Timestamp, validator.VotingPower)
-		}
-	}
-
-	return weightedMedian(weightedTimes, totalVotingPower)
+	return block
 }
 
 //------------------------------------------------------------------------
@@ -325,11 +303,11 @@ func MakeGenesisStateFromFile(genDocFile string) (State, error) {
 func MakeGenesisDocFromFile(genDocFile string) (*types.GenesisDoc, error) {
 	genDocJSON, err := os.ReadFile(genDocFile)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't read GenesisDoc file: %v", err)
+		return nil, fmt.Errorf("couldn't read GenesisDoc file: %w", err)
 	}
 	genDoc, err := types.GenesisDocFromJSON(genDocJSON)
 	if err != nil {
-		return nil, fmt.Errorf("error reading GenesisDoc: %v", err)
+		return nil, fmt.Errorf("error reading GenesisDoc: %w", err)
 	}
 	return genDoc, nil
 }

@@ -2,6 +2,62 @@
 
 Friendly reminder: We have a [bug bounty program](https://hackerone.com/cosmos).
 
+## v0.35.2
+
+February 28, 2022
+
+Special thanks to external contributors on this release: @ashcherbakov, @yihuang, @waelsy123
+
+### IMPROVEMENTS
+
+- [consensus] [\#7875](https://github.com/tendermint/tendermint/pull/7875) additional timing metrics. (@williambanfield)
+
+### BUG FIXES
+
+- [abci] [\#7990](https://github.com/tendermint/tendermint/pull/7990) revert buffer limit change. (@williambanfield)
+- [cli] [#7837](https://github.com/tendermint/tendermint/pull/7837) fix app hash in state rollback. (@yihuang)
+- [cli] [\#7869](https://github.com/tendermint/tendermint/pull/7869) Update unsafe-reset-all command to match release v35. (waelsy123)
+- [light] [\#7640](https://github.com/tendermint/tendermint/pull/7640) Light Client: fix absence proof verification (@ashcherbakov)
+- [light] [\#7641](https://github.com/tendermint/tendermint/pull/7641) Light Client: fix querying against the latest height (@ashcherbakov)
+- [mempool] [\#7718](https://github.com/tendermint/tendermint/pull/7718) return duplicate tx errors more consistently. (@tychoish)
+- [rpc] [\#7744](https://github.com/tendermint/tendermint/pull/7744) fix layout of endpoint list. (@creachadair)
+- [statesync] [\#7886](https://github.com/tendermint/tendermint/pull/7886) assert app version matches. (@cmwaters)
+
+## v0.35.1
+
+January 26, 2022
+
+Special thanks to external contributors on this release: @altergui, @odeke-em,
+@thanethomson
+
+### BREAKING CHANGES
+
+- CLI/RPC/Config
+
+  - [config] [\#7276](https://github.com/tendermint/tendermint/pull/7276) rpc: Add experimental config params to allow for subscription buffer size control (@thanethomson).
+
+- P2P Protocol
+
+  - [p2p] [\#7265](https://github.com/tendermint/tendermint/pull/7265) Peer manager reduces peer score for each failed dial attempts for peers that have not successfully dialed. (@tychoish)
+  - [p2p] [\#7594](https://github.com/tendermint/tendermint/pull/7594) always advertise self, to enable mutual address discovery. (@altergui)
+
+### FEATURES
+
+- [rpc] [\#7270](https://github.com/tendermint/tendermint/pull/7270) Add `header` and `header_by_hash` RPC Client queries. (@fedekunze) (@cmwaters)
+
+### IMPROVEMENTS
+
+- [internal/protoio] [\#7325](https://github.com/tendermint/tendermint/pull/7325) Optimized `MarshalDelimited` by inlining the common case and using a `sync.Pool` in the worst case. (@odeke-em)
+- [\#7338](https://github.com/tendermint/tendermint/pull/7338) pubsub: Performance improvements for the event query API (backport of #7319) (@creachadair)
+- [\#7252](https://github.com/tendermint/tendermint/pull/7252) Add basic metrics to the indexer package. (@creachadair)
+- [\#7338](https://github.com/tendermint/tendermint/pull/7338) Performance improvements for the event query API. (@creachadair)
+
+### BUG FIXES
+
+- [\#7310](https://github.com/tendermint/tendermint/issues/7310) pubsub: Report a non-nil error when shutting down (fixes #7306).
+- [\#7355](https://github.com/tendermint/tendermint/pull/7355) Fix incorrect tests using the PSQL sink. (@creachadair)
+- [\#7683](https://github.com/tendermint/tendermint/pull/7683) rpc: check error code for broadcast_tx_commit. (@tychoish)
+
 ## v0.35.0
 
 November 4, 2021
@@ -173,6 +229,33 @@ Special thanks to external contributors on this release: @JayT106,
 - [rpc] [\#6615](https://github.com/tendermint/tendermint/pull/6615) Add TotalGasUsed to block_results response (@crypto-facs)
 - [cmd/tendermint/commands] [\#6623](https://github.com/tendermint/tendermint/pull/6623) replace `$HOME/.some/test/dir` with `t.TempDir` (@tanyabouman)
 - [statesync] \6807 Implement P2P state provider as an alternative to RPC (@cmwaters)
+
+## v0.34.16
+
+Special thanks to external contributors on this release: @yihuang
+
+### BUG FIXES
+
+- [consensus] [\#7617](https://github.com/tendermint/tendermint/issues/7617) calculate prevote message delay metric (backport #7551) (@williambanfield).
+- [consensus] [\#7631](https://github.com/tendermint/tendermint/issues/7631) check proposal non-nil in prevote message delay metric (backport #7625) (@williambanfield).
+- [statesync] [\#7885](https://github.com/tendermint/tendermint/issues/7885) statesync: assert app version matches (backport #7856) (@cmwaters).
+- [statesync] [\#7881](https://github.com/tendermint/tendermint/issues/7881) fix app hash in state rollback (backport #7837) (@cmwaters).
+- [cli] [#7837](https://github.com/tendermint/tendermint/pull/7837) fix app hash in state rollback. (@yihuang).
+
+## v0.34.15
+
+Special thanks to external contributors on this release: @thanethomson
+
+### BUG FIXES
+
+- [\#7368](https://github.com/tendermint/tendermint/issues/7368) cmd: add integration test for rollback functionality (@cmwaters).
+- [\#7309](https://github.com/tendermint/tendermint/issues/7309) pubsub: Report a non-nil error when shutting down (fixes #7306).
+- [\#7057](https://github.com/tendermint/tendermint/pull/7057) Import Postgres driver support for the psql indexer (@creachadair).
+- [\#7106](https://github.com/tendermint/tendermint/pull/7106) Revert mutex change to ABCI Clients (@tychoish).
+
+### IMPROVEMENTS
+
+- [config] [\#7230](https://github.com/tendermint/tendermint/issues/7230) rpc: Add experimental config params to allow for subscription buffer size control (@thanethomson).
 
 ## v0.34.14
 
@@ -930,7 +1013,7 @@ and a validator address plus a timestamp. Note we may remove the validator
 address & timestamp fields in the future (see ADR-25).
 
 `lite2` package has been added to solve `lite` issues and introduce weak
-subjectivity interface. Refer to the [spec](https://github.com/tendermint/spec/blob/master/spec/consensus/light-client.md) for complete details.
+subjectivity interface. Refer to the [spec](./spec/consensus/light-client/) for complete details.
 `lite` package is now deprecated and will be removed in v0.34 release.
 
 ### BREAKING CHANGES:

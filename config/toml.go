@@ -9,6 +9,7 @@ import (
 	"text/template"
 
 	tmos "github.com/tendermint/tendermint/libs/os"
+	tmrand "github.com/tendermint/tendermint/libs/rand"
 )
 
 // DefaultDirPerm is the default permissions used when creating directories.
@@ -218,6 +219,33 @@ max-subscription-clients = {{ .RPC.MaxSubscriptionClients }}
 # If you're using a Local RPC client and /broadcast_tx_commit, set this
 # to the estimated maximum number of broadcast_tx_commit calls per block.
 max-subscriptions-per-client = {{ .RPC.MaxSubscriptionsPerClient }}
+
+# If true, disable the websocket interface to the RPC service.  This has
+# the effect of disabling the /subscribe, /unsubscribe, and /unsubscribe_all
+# methods for event subscription.
+#
+# EXPERIMENTAL: This setting will be removed in Tendermint v0.37.
+experimental-disable-websocket = {{ .RPC.ExperimentalDisableWebsocket }}
+
+# The time window size for the event log. All events up to this long before
+# the latest (up to EventLogMaxItems) will be available for subscribers to
+# fetch via the /events method.  If 0 (the default) the event log and the
+# /events RPC method are disabled.
+event-log-window-size = "{{ .RPC.EventLogWindowSize }}"
+
+# The maxiumum number of events that may be retained by the event log.  If
+# this value is 0, no upper limit is set. Otherwise, items in excess of
+# this number will be discarded from the event log.
+#
+# Warning: This setting is a safety valve. Setting it too low may cause
+# subscribers to miss events.  Try to choose a value higher than the
+# maximum worst-case expected event load within the chosen window size in
+# ordinary operation.
+#
+# For example, if the window size is 10 minutes and the node typically
+# averages 1000 events per ten minutes, but with occasional known spikes of
+# up to 2000, choose a value > 2000.
+event-log-max-items = {{ .RPC.EventLogMaxItems }}
 
 # How long to wait for a tx to be committed during /broadcast_tx_commit.
 # WARNING: Using a value larger than 10s will result in increasing the
@@ -503,13 +531,13 @@ namespace = "{{ .Instrumentation.Namespace }}"
 
 /****** these are for test settings ***********/
 
-func ResetTestRoot(testName string) (*Config, error) {
-	return ResetTestRootWithChainID(testName, "")
+func ResetTestRoot(dir, testName string) (*Config, error) {
+	return ResetTestRootWithChainID(dir, testName, "")
 }
 
-func ResetTestRootWithChainID(testName string, chainID string) (*Config, error) {
+func ResetTestRootWithChainID(dir, testName string, chainID string) (*Config, error) {
 	// create a unique, concurrency-safe test directory under os.TempDir()
-	rootDir, err := os.MkdirTemp("", fmt.Sprintf("%s-%s_", chainID, testName))
+	rootDir, err := os.MkdirTemp(dir, fmt.Sprintf("%s-%s_", chainID, testName))
 	if err != nil {
 		return nil, err
 	}
@@ -549,6 +577,7 @@ func ResetTestRootWithChainID(testName string, chainID string) (*Config, error) 
 	}
 
 	config := TestConfig().SetRoot(rootDir)
+	config.Instrumentation.Namespace = fmt.Sprintf("%s_%s_%s", testName, chainID, tmrand.Str(16))
 	return config, nil
 }
 
@@ -568,6 +597,18 @@ var testGenesisFmt = `{
 			"max_bytes": "22020096",
 			"max_gas": "-1",
 			"time_iota_ms": "10"
+		},
+		"synchrony": {
+			"message_delay": "500000000",
+			"precision": "10000000"
+		},
+		"timeout": {
+			"propose": "30000000000",
+			"propose_delta": "50000000",
+			"vote": "30000000000",
+			"vote_delta": "50000000",
+			"commit": "10000000000",
+			"bypass_commit_timeout": false
 		},
 		"evidence": {
 			"max_age_num_blocks": "100000",

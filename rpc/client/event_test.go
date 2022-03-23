@@ -26,6 +26,7 @@ func MakeTxKV() ([]byte, []byte, []byte) {
 }
 
 func testTxEventsSent(ctx context.Context, t *testing.T, broadcastMethod string, c client.Client) {
+	t.Helper()
 	// make the tx
 	_, _, tx := MakeTxKV()
 
@@ -43,7 +44,7 @@ func testTxEventsSent(ctx context.Context, t *testing.T, broadcastMethod string,
 		case "sync":
 			txres, err = c.BroadcastTxSync(ctx, tx)
 		default:
-			panic(fmt.Sprintf("Unknown broadcastMethod %s", broadcastMethod))
+			require.FailNowf(t, "Unknown broadcastMethod %s", broadcastMethod)
 		}
 		if assert.NoError(t, err) {
 			assert.Equal(t, txres.Code, abci.CodeTypeOK)
@@ -51,8 +52,14 @@ func testTxEventsSent(ctx context.Context, t *testing.T, broadcastMethod string,
 	}()
 
 	// and wait for confirmation
-	evt, err := client.WaitForOneEvent(c, types.EventTxValue, waitForEventTimeout)
-	require.Nil(t, err)
+	ectx, cancel := context.WithTimeout(ctx, waitForEventTimeout)
+	defer cancel()
+
+	// Wait for the transaction we sent to be confirmed.
+	query := fmt.Sprintf(`tm.event = '%s' AND tx.hash = '%X'`,
+		types.EventTxValue, types.Tx(tx).Hash())
+	evt, err := client.WaitForOneEvent(ectx, c, query)
+	require.NoError(t, err)
 
 	// and make sure it has the proper info
 	txe, ok := evt.(types.EventDataTx)
