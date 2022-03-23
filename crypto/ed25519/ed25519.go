@@ -12,7 +12,7 @@ import (
 
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/tmhash"
-	tmjson "github.com/tendermint/tendermint/libs/json"
+	"github.com/tendermint/tendermint/internal/jsontypes"
 )
 
 //-------------------------------------
@@ -56,12 +56,15 @@ const (
 )
 
 func init() {
-	tmjson.RegisterType(PubKey{}, PubKeyName)
-	tmjson.RegisterType(PrivKey{}, PrivKeyName)
+	jsontypes.MustRegister(PubKey{})
+	jsontypes.MustRegister(PrivKey{})
 }
 
 // PrivKey implements crypto.PrivKey.
 type PrivKey []byte
+
+// TypeTag satisfies the jsontypes.Tagged interface.
+func (PrivKey) TypeTag() string { return PrivKeyName }
 
 // Bytes returns the privkey byte format.
 func (privKey PrivKey) Bytes() []byte {
@@ -150,6 +153,9 @@ var _ crypto.PubKey = PubKey{}
 
 // PubKeyEd25519 implements crypto.PubKey for the Ed25519 signature scheme.
 type PubKey []byte
+
+// TypeTag satisfies the jsontypes.Tagged interface.
+func (PubKey) TypeTag() string { return PubKeyName }
 
 // Address is the SHA256-20 of the raw pubkey bytes.
 func (pubKey PubKey) Address() crypto.Address {

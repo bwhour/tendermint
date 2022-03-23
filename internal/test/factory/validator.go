@@ -2,36 +2,35 @@ package factory
 
 import (
 	"context"
-	"fmt"
-	"math/rand"
 	"sort"
+	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/tendermint/tendermint/types"
 )
 
-func RandValidator(randPower bool, minPower int64) (*types.Validator, types.PrivValidator) {
+func Validator(ctx context.Context, votingPower int64) (*types.Validator, types.PrivValidator, error) {
 	privVal := types.NewMockPV()
-	votePower := minPower
-	if randPower {
-		// nolint:gosec // G404: Use of weak random number generator
-		votePower += int64(rand.Uint32())
-	}
-	pubKey, err := privVal.GetPubKey(context.Background())
+	pubKey, err := privVal.GetPubKey(ctx)
 	if err != nil {
-		panic(fmt.Errorf("could not retrieve pubkey %w", err))
+		return nil, nil, err
 	}
-	val := types.NewValidator(pubKey, votePower)
-	return val, privVal
+
+	val := types.NewValidator(pubKey, votingPower)
+	return val, privVal, nil
 }
 
-func RandValidatorSet(numValidators int, votingPower int64) (*types.ValidatorSet, []types.PrivValidator) {
+func ValidatorSet(ctx context.Context, t *testing.T, numValidators int, votingPower int64) (*types.ValidatorSet, []types.PrivValidator) {
 	var (
 		valz           = make([]*types.Validator, numValidators)
 		privValidators = make([]types.PrivValidator, numValidators)
 	)
+	t.Helper()
 
 	for i := 0; i < numValidators; i++ {
-		val, privValidator := RandValidator(false, votingPower)
+		val, privValidator, err := Validator(ctx, votingPower)
+		require.NoError(t, err)
 		valz[i] = val
 		privValidators[i] = privValidator
 	}

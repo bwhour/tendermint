@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -19,7 +21,6 @@ import (
 
 	"github.com/tendermint/tendermint/libs/log"
 	tmnet "github.com/tendermint/tendermint/libs/net"
-	tmos "github.com/tendermint/tendermint/libs/os"
 	"github.com/tendermint/tendermint/privval"
 	grpcprivval "github.com/tendermint/tendermint/privval/grpc"
 	privvalproto "github.com/tendermint/tendermint/proto/tendermint/privval"
@@ -44,11 +45,18 @@ func main() {
 		keyFile          = flag.String("keyfile", "", "absolute path to server key")
 		rootCA           = flag.String("rootcafile", "", "absolute path to root CA")
 		prometheusAddr   = flag.String("prometheus-addr", "", "address for prometheus endpoint (host:port)")
-
-		logger = log.MustNewDefaultLogger(log.LogFormatPlain, log.LogLevelInfo, false).
-			With("module", "priv_val")
 	)
 	flag.Parse()
+
+	logger, err := log.NewDefaultLogger(log.LogFormatPlain, log.LogLevelInfo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to construct logger: %v", err)
+		os.Exit(1)
+	}
+	logger = logger.With("module", "priv_val")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	logger.Info(
 		"Starting private validator",
@@ -130,9 +138,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Stop upon receiving SIGTERM or CTRL-C.
-	tmos.TrapSignal(logger, func() {
-		logger.Debug("SignerServer: calling Close")
+	opctx, opcancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer opcancel()
+	go func() {
+		<-opctx.Done()
 		if *prometheusAddr != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 			defer cancel()
@@ -142,7 +151,7 @@ func main() {
 			}
 		}
 		s.GracefulStop()
-	})
+	}()
 
 	// Run forever.
 	select {}

@@ -65,7 +65,13 @@ Note the context/background should be written in the present tense.
 - [ADR-059: Evidence-Composition-and-Lifecycle](./adr-059-evidence-composition-and-lifecycle.md)
 - [ADR-062: P2P-Architecture](./adr-062-p2p-architecture.md)
 - [ADR-063: Privval-gRPC](./adr-063-privval-grpc.md)
-- [ADR-066-E2E-Testing](./adr-066-e2e-testing.md)
+- [ADR-066: E2E-Testing](./adr-066-e2e-testing.md)
+- [ADR-072: Restore Requests for Comments](./adr-072-request-for-comments.md)
+- [ADR-077: Block Retention](./adr-077-block-retention.md)
+- [ADR-078: Non-zero Genesis](./adr-078-nonzero-genesis.md)
+- [ADR-079: ED25519 Verification](./adr-079-ed25519-verification.md)
+- [ADR-080: Reverse Sync](./adr-080-reverse-sync.md)
+
 ### Accepted
 
 - [ADR-006: Trust-Metric](./adr-006-trust-metric.md)
@@ -77,13 +83,19 @@ Note the context/background should be written in the present tense.
 - [ADR-065: Custom Event Indexing](./adr-065-custom-event-indexing.md)
 - [ADR-068: Reverse-Sync](./adr-068-reverse-sync.md)
 - [ADR-067: Mempool Refactor](./adr-067-mempool-refactor.md)
+- [ADR-075: RPC Event Subscription Interface](./adr-075-rpc-subscription.md)
+- [ADR-076: Combine Spec and Tendermint Repositories](./adr-076-combine-spec-repo.md)
+- [ADR-081: Protocol Buffers Management](./adr-081-protobuf-mgmt.md)
+
+### Deprecated
+
+None
 
 ### Rejected
 
 - [ADR-023: ABCI-Propose-tx](./adr-023-ABCI-propose-tx.md)
 - [ADR-029: Check-Tx-Consensus](./adr-029-check-tx-consensus.md)
 - [ADR-058: Event-Hashing](./adr-058-event-hashing.md)
-
 
 ### Proposed
 
@@ -99,4 +111,5 @@ Note the context/background should be written in the present tense.
 - [ADR-057: RPC](./adr-057-RPC.md)
 - [ADR-069: Node Initialization](./adr-069-flexible-node-initialization.md)
 - [ADR-071: Proposer-Based Timestamps](adr-071-proposer-based-timestamps.md)
-- [ADR-072: Restore Requests for Comments](./adr-072-request-for-comments.md)
+- [ADR-074: Migrate Timeout Parameters to Consensus Parameters](./adr-074-timeout-params.md)
+

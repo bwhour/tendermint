@@ -5,15 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	abciclient "github.com/tendermint/tendermint/abci/client"
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/config"
 	"github.com/tendermint/tendermint/internal/libs/clist"
-	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
-	"github.com/tendermint/tendermint/internal/proxy"
 	"github.com/tendermint/tendermint/libs/log"
 	tmmath "github.com/tendermint/tendermint/libs/math"
 	"github.com/tendermint/tendermint/types"
@@ -32,7 +31,7 @@ type TxMempool struct {
 	logger       log.Logger
 	metrics      *Metrics
 	config       *config.MempoolConfig
-	proxyAppConn proxy.AppConnMempool
+	proxyAppConn abciclient.Client
 
 	// txsAvailable fires once for each height when the mempool is not empty
 	txsAvailable         chan struct{}
@@ -86,7 +85,7 @@ type TxMempool struct {
 	// from the mempool. A read-lock is implicitly acquired when executing CheckTx,
 	// however, a caller must explicitly grab a write-lock via Lock when updating
 	// the mempool via Update().
-	mtx       tmsync.RWMutex
+	mtx       sync.RWMutex
 	preCheck  PreCheckFunc
 	postCheck PostCheckFunc
 }
@@ -94,8 +93,7 @@ type TxMempool struct {
 func NewTxMempool(
 	logger log.Logger,
 	cfg *config.MempoolConfig,
-	proxyAppConn proxy.AppConnMempool,
-	height int64,
+	proxyAppConn abciclient.Client,
 	options ...TxMempoolOption,
 ) *TxMempool {
 
@@ -103,7 +101,7 @@ func NewTxMempool(
 		logger:        logger,
 		config:        cfg,
 		proxyAppConn:  proxyAppConn,
-		height:        height,
+		height:        -1,
 		cache:         NopTxCache{},
 		metrics:       NopMetrics(),
 		txStore:       NewTxStore(),
@@ -120,8 +118,6 @@ func NewTxMempool(
 	if cfg.CacheSize > 0 {
 		txmp.cache = NewLRUTxCache(cfg.CacheSize)
 	}
-
-	proxyAppConn.SetResponseCallback(txmp.defaultTxCallback)
 
 	for _, opt := range options {
 		opt(txmp)
@@ -175,8 +171,8 @@ func (txmp *TxMempool) SizeBytes() int64 {
 // FlushAppConn executes FlushSync on the mempool's proxyAppConn.
 //
 // NOTE: The caller must obtain a write-lock prior to execution.
-func (txmp *TxMempool) FlushAppConn() error {
-	return txmp.proxyAppConn.FlushSync(context.Background())
+func (txmp *TxMempool) FlushAppConn(ctx context.Context) error {
+	return txmp.proxyAppConn.Flush(ctx)
 }
 
 // WaitForNextTx returns a blocking channel that will be closed when the next
@@ -207,11 +203,12 @@ func (txmp *TxMempool) TxsAvailable() <-chan struct{} {
 	return txmp.txsAvailable
 }
 
-// CheckTx executes the ABCI CheckTx method for a given transaction. It acquires
-// a read-lock attempts to execute the application's CheckTx ABCI method via
-// CheckTxAsync. We return an error if any of the following happen:
+// CheckTx executes the ABCI CheckTx method for a given transaction.
+// It acquires a read-lock and attempts to execute the application's
+// CheckTx ABCI method synchronously. We return an error if any of
+// the following happen:
 //
-// - The CheckTxAsync execution fails.
+// - The CheckTx execution fails.
 // - The transaction already exists in the cache and we've already received the
 //   transaction from the peer. Otherwise, if it solely exists in the cache, we
 //   return nil.
@@ -230,13 +227,9 @@ func (txmp *TxMempool) TxsAvailable() <-chan struct{} {
 func (txmp *TxMempool) CheckTx(
 	ctx context.Context,
 	tx types.Tx,
-	cb func(*abci.Response),
+	cb func(*abci.ResponseCheckTx),
 	txInfo TxInfo,
 ) error {
-	if ctx == nil {
-		ctx = context.TODO()
-	}
-
 	txmp.mtx.RLock()
 	defer txmp.mtx.RUnlock()
 
@@ -259,44 +252,37 @@ func (txmp *TxMempool) CheckTx(
 
 	txHash := tx.Key()
 
-	// We add the transaction to the mempool's cache and if the transaction already
-	// exists, i.e. false is returned, then we check if we've seen this transaction
-	// from the same sender and error if we have. Otherwise, we return nil.
+	// We add the transaction to the mempool's cache and if the
+	// transaction is already present in the cache, i.e. false is returned, then we
+	// check if we've seen this transaction and error if we have.
 	if !txmp.cache.Push(tx) {
-		wtx, ok := txmp.txStore.GetOrSetPeerByTxHash(txHash, txInfo.SenderID)
-		if wtx != nil && ok {
-			// We already have the transaction stored and the we've already seen this
-			// transaction from txInfo.SenderID.
-			return types.ErrTxInCache
-		}
-
-		txmp.logger.Debug("tx exists already in cache", "tx_hash", tx.Hash())
-		return nil
+		txmp.txStore.GetOrSetPeerByTxHash(txHash, txInfo.SenderID)
+		return types.ErrTxInCache
 	}
 
-	reqRes, err := txmp.proxyAppConn.CheckTxAsync(ctx, abci.RequestCheckTx{Tx: tx})
+	res, err := txmp.proxyAppConn.CheckTx(ctx, abci.RequestCheckTx{Tx: tx})
 	if err != nil {
 		txmp.cache.Remove(tx)
 		return err
 	}
 
-	reqRes.SetCallback(func(res *abci.Response) {
-		if txmp.recheckCursor != nil {
-			panic("recheck cursor is non-nil in CheckTx callback")
-		}
+	if txmp.recheckCursor != nil {
+		return errors.New("recheck cursor is non-nil")
+	}
 
-		wtx := &WrappedTx{
-			tx:        tx,
-			hash:      txHash,
-			timestamp: time.Now().UTC(),
-			height:    txmp.height,
-		}
-		txmp.initTxCallback(wtx, res, txInfo)
+	wtx := &WrappedTx{
+		tx:        tx,
+		hash:      txHash,
+		timestamp: time.Now().UTC(),
+		height:    txmp.height,
+	}
 
-		if cb != nil {
-			cb(res)
-		}
-	})
+	txmp.defaultTxCallback(tx, res)
+	txmp.initTxCallback(wtx, res, txInfo)
+
+	if cb != nil {
+		cb(res)
+	}
 
 	return nil
 }
@@ -428,13 +414,13 @@ func (txmp *TxMempool) ReapMaxTxs(max int) types.Txs {
 // NOTE:
 // - The caller must explicitly acquire a write-lock.
 func (txmp *TxMempool) Update(
+	ctx context.Context,
 	blockHeight int64,
 	blockTxs types.Txs,
-	deliverTxResponses []*abci.ResponseDeliverTx,
+	execTxResult []*abci.ExecTxResult,
 	newPreFn PreCheckFunc,
 	newPostFn PostCheckFunc,
 ) error {
-
 	txmp.height = blockHeight
 	txmp.notifiedTxsAvailable = false
 
@@ -446,7 +432,7 @@ func (txmp *TxMempool) Update(
 	}
 
 	for i, tx := range blockTxs {
-		if deliverTxResponses[i].Code == abci.CodeTypeOK {
+		if execTxResult[i].Code == abci.CodeTypeOK {
 			// add the valid committed transaction to the cache (if missing)
 			_ = txmp.cache.Push(tx)
 		} else if !txmp.config.KeepInvalidTxsInCache {
@@ -472,7 +458,7 @@ func (txmp *TxMempool) Update(
 				"num_txs", txmp.Size(),
 				"height", blockHeight,
 			)
-			txmp.updateReCheckTxs()
+			txmp.updateReCheckTxs(ctx)
 		} else {
 			txmp.notifyTxsAvailable()
 		}
@@ -501,25 +487,20 @@ func (txmp *TxMempool) Update(
 //
 // NOTE:
 // - An explicit lock is NOT required.
-func (txmp *TxMempool) initTxCallback(wtx *WrappedTx, res *abci.Response, txInfo TxInfo) {
-	checkTxRes, ok := res.Value.(*abci.Response_CheckTx)
-	if !ok {
-		return
-	}
-
+func (txmp *TxMempool) initTxCallback(wtx *WrappedTx, res *abci.ResponseCheckTx, txInfo TxInfo) {
 	var err error
 	if txmp.postCheck != nil {
-		err = txmp.postCheck(wtx.tx, checkTxRes.CheckTx)
+		err = txmp.postCheck(wtx.tx, res)
 	}
 
-	if err != nil || checkTxRes.CheckTx.Code != abci.CodeTypeOK {
+	if err != nil || res.Code != abci.CodeTypeOK {
 		// ignore bad transactions
 		txmp.logger.Info(
 			"rejected bad transaction",
 			"priority", wtx.priority,
 			"tx", fmt.Sprintf("%X", wtx.tx.Hash()),
 			"peer_id", txInfo.SenderNodeID,
-			"code", checkTxRes.CheckTx.Code,
+			"code", res.Code,
 			"post_check_err", err,
 		)
 
@@ -529,13 +510,13 @@ func (txmp *TxMempool) initTxCallback(wtx *WrappedTx, res *abci.Response, txInfo
 			txmp.cache.Remove(wtx.tx)
 		}
 		if err != nil {
-			checkTxRes.CheckTx.MempoolError = err.Error()
+			res.MempoolError = err.Error()
 		}
 		return
 	}
 
-	sender := checkTxRes.CheckTx.Sender
-	priority := checkTxRes.CheckTx.Priority
+	sender := res.Sender
+	priority := res.Priority
 
 	if len(sender) > 0 {
 		if wtx := txmp.txStore.GetTxBySender(sender); wtx != nil {
@@ -587,7 +568,7 @@ func (txmp *TxMempool) initTxCallback(wtx *WrappedTx, res *abci.Response, txInfo
 		}
 	}
 
-	wtx.gasWanted = checkTxRes.CheckTx.GasWanted
+	wtx.gasWanted = res.GasWanted
 	wtx.priority = priority
 	wtx.sender = sender
 	wtx.peers = map[uint16]struct{}{
@@ -608,28 +589,20 @@ func (txmp *TxMempool) initTxCallback(wtx *WrappedTx, res *abci.Response, txInfo
 	txmp.notifyTxsAvailable()
 }
 
-// defaultTxCallback is the CheckTx application callback used when a transaction
-// is being re-checked (if re-checking is enabled). The caller must hold a mempool
-// write-lock (via Lock()) and when executing Update(), if the mempool is non-empty
-// and Recheck is enabled, then all remaining transactions will be rechecked via
-// CheckTxAsync. The order transactions are rechecked must be the same as the
-// order in which this callback is called.
-func (txmp *TxMempool) defaultTxCallback(req *abci.Request, res *abci.Response) {
+// defaultTxCallback is the CheckTx application callback used when a
+// transaction is being re-checked (if re-checking is enabled). The
+// caller must hold a mempool write-lock (via Lock()) and when
+// executing Update(), if the mempool is non-empty and Recheck is
+// enabled, then all remaining transactions will be rechecked via
+// CheckTx. The order transactions are rechecked must be the same as
+// the order in which this callback is called.
+func (txmp *TxMempool) defaultTxCallback(tx types.Tx, res *abci.ResponseCheckTx) {
 	if txmp.recheckCursor == nil {
 		return
 	}
 
 	txmp.metrics.RecheckTimes.Add(1)
 
-	checkTxRes, ok := res.Value.(*abci.Response_CheckTx)
-	if !ok {
-		txmp.logger.Error("received incorrect type in mempool callback",
-			"expected", reflect.TypeOf(&abci.Response_CheckTx{}).Name(),
-			"got", reflect.TypeOf(res.Value).Name(),
-		)
-		return
-	}
-	tx := req.GetCheckTx().Tx
 	wtx := txmp.recheckCursor.Value.(*WrappedTx)
 
 	// Search through the remaining list of tx to recheck for a transaction that matches
@@ -645,7 +618,7 @@ func (txmp *TxMempool) defaultTxCallback(req *abci.Request, res *abci.Response) 
 		txmp.logger.Error(
 			"re-CheckTx transaction mismatch",
 			"got", wtx.tx.Hash(),
-			"expected", types.Tx(tx).Key(),
+			"expected", tx.Key(),
 		)
 
 		if txmp.recheckCursor == txmp.recheckEnd {
@@ -666,18 +639,18 @@ func (txmp *TxMempool) defaultTxCallback(req *abci.Request, res *abci.Response) 
 	if !txmp.txStore.IsTxRemoved(wtx.hash) {
 		var err error
 		if txmp.postCheck != nil {
-			err = txmp.postCheck(tx, checkTxRes.CheckTx)
+			err = txmp.postCheck(tx, res)
 		}
 
-		if checkTxRes.CheckTx.Code == abci.CodeTypeOK && err == nil {
-			wtx.priority = checkTxRes.CheckTx.Priority
+		if res.Code == abci.CodeTypeOK && err == nil {
+			wtx.priority = res.Priority
 		} else {
 			txmp.logger.Debug(
 				"existing transaction no longer valid; failed re-CheckTx callback",
 				"priority", wtx.priority,
 				"tx", fmt.Sprintf("%X", wtx.tx.Hash()),
 				"err", err,
-				"code", checkTxRes.CheckTx.Code,
+				"code", res.Code,
 			)
 
 			if wtx.gossipEl != txmp.recheckCursor {
@@ -707,20 +680,19 @@ func (txmp *TxMempool) defaultTxCallback(req *abci.Request, res *abci.Response) 
 }
 
 // updateReCheckTxs updates the recheck cursors using the gossipIndex. For
-// each transaction, it executes CheckTxAsync. The global callback defined on
+// each transaction, it executes CheckTx. The global callback defined on
 // the proxyAppConn will be executed for each transaction after CheckTx is
 // executed.
 //
 // NOTE:
 // - The caller must have a write-lock when executing updateReCheckTxs.
-func (txmp *TxMempool) updateReCheckTxs() {
+func (txmp *TxMempool) updateReCheckTxs(ctx context.Context) {
 	if txmp.Size() == 0 {
 		panic("attempted to update re-CheckTx txs when mempool is empty")
 	}
 
 	txmp.recheckCursor = txmp.gossipIndex.Front()
 	txmp.recheckEnd = txmp.gossipIndex.Back()
-	ctx := context.Background()
 
 	for e := txmp.gossipIndex.Front(); e != nil; e = e.Next() {
 		wtx := e.Value.(*WrappedTx)
@@ -728,18 +700,20 @@ func (txmp *TxMempool) updateReCheckTxs() {
 		// Only execute CheckTx if the transaction is not marked as removed which
 		// could happen if the transaction was evicted.
 		if !txmp.txStore.IsTxRemoved(wtx.hash) {
-			_, err := txmp.proxyAppConn.CheckTxAsync(ctx, abci.RequestCheckTx{
+			res, err := txmp.proxyAppConn.CheckTx(ctx, abci.RequestCheckTx{
 				Tx:   wtx.tx,
 				Type: abci.CheckTxType_Recheck,
 			})
 			if err != nil {
 				// no need in retrying since the tx will be rechecked after the next block
 				txmp.logger.Error("failed to execute CheckTx during rechecking", "err", err)
+				continue
 			}
+			txmp.defaultTxCallback(wtx.tx, res)
 		}
 	}
 
-	if _, err := txmp.proxyAppConn.FlushAsync(ctx); err != nil {
+	if err := txmp.proxyAppConn.Flush(ctx); err != nil {
 		txmp.logger.Error("failed to flush transactions during rechecking", "err", err)
 	}
 }

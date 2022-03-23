@@ -2,12 +2,14 @@ package types
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/crypto/encoding"
+	"github.com/tendermint/tendermint/internal/jsontypes"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 )
 
@@ -15,11 +17,47 @@ import (
 // NOTE: The ProposerPriority is not included in Validator.Hash();
 // make sure to update that method if changes are made here
 type Validator struct {
-	Address     Address       `json:"address"`
-	PubKey      crypto.PubKey `json:"pub_key"`
-	VotingPower int64         `json:"voting_power"`
+	Address          Address
+	PubKey           crypto.PubKey
+	VotingPower      int64
+	ProposerPriority int64
+}
 
-	ProposerPriority int64 `json:"proposer_priority"`
+type validatorJSON struct {
+	Address          Address         `json:"address"`
+	PubKey           json.RawMessage `json:"pub_key,omitempty"`
+	VotingPower      int64           `json:"voting_power,string"`
+	ProposerPriority int64           `json:"proposer_priority,string"`
+}
+
+func (v Validator) MarshalJSON() ([]byte, error) {
+	val := validatorJSON{
+		Address:          v.Address,
+		VotingPower:      v.VotingPower,
+		ProposerPriority: v.ProposerPriority,
+	}
+	if v.PubKey != nil {
+		pk, err := jsontypes.Marshal(v.PubKey)
+		if err != nil {
+			return nil, err
+		}
+		val.PubKey = pk
+	}
+	return json.Marshal(val)
+}
+
+func (v *Validator) UnmarshalJSON(data []byte) error {
+	var val validatorJSON
+	if err := json.Unmarshal(data, &val); err != nil {
+		return err
+	}
+	if err := jsontypes.Unmarshal(val.PubKey, &v.PubKey); err != nil {
+		return err
+	}
+	v.Address = val.Address
+	v.VotingPower = val.VotingPower
+	v.ProposerPriority = val.ProposerPriority
+	return nil
 }
 
 // NewValidator returns a new validator with the given pubkey and voting power.

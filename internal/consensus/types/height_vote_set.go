@@ -1,12 +1,12 @@
 package types
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	tmjson "github.com/tendermint/tendermint/libs/json"
 	tmmath "github.com/tendermint/tendermint/libs/math"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	"github.com/tendermint/tendermint/types"
@@ -85,7 +85,11 @@ func (hvs *HeightVoteSet) Round() int32 {
 func (hvs *HeightVoteSet) SetRound(round int32) {
 	hvs.mtx.Lock()
 	defer hvs.mtx.Unlock()
-	newRound := tmmath.SafeSubInt32(hvs.round, 1)
+	newRound, err := tmmath.SafeSubInt32(hvs.round, 1)
+	if err != nil {
+		panic(err)
+	}
+
 	if hvs.round != 0 && (round < newRound) {
 		panic("SetRound() must increment hvs.round")
 	}
@@ -195,7 +199,7 @@ func (hvs *HeightVoteSet) SetPeerMaj23(
 	if voteSet == nil {
 		return nil // something we don't know about yet
 	}
-	return voteSet.SetPeerMaj23(types.P2PID(peerID), blockID)
+	return voteSet.SetPeerMaj23(string(peerID), blockID)
 }
 
 //---------------------------------------------------------
@@ -237,7 +241,7 @@ func (hvs *HeightVoteSet) StringIndented(indent string) string {
 func (hvs *HeightVoteSet) MarshalJSON() ([]byte, error) {
 	hvs.mtx.Lock()
 	defer hvs.mtx.Unlock()
-	return tmjson.Marshal(hvs.toAllRoundVotes())
+	return json.Marshal(hvs.toAllRoundVotes())
 }
 
 func (hvs *HeightVoteSet) toAllRoundVotes() []roundVotes {

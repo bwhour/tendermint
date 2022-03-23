@@ -1,6 +1,7 @@
 package blocksync
 
 import (
+	"context"
 	"fmt"
 	mrand "math/rand"
 	"testing"
@@ -78,22 +79,20 @@ func makePeers(numPeers int, minHeight, maxHeight int64) testPeers {
 }
 
 func TestBlockPoolBasic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	start := int64(42)
 	peers := makePeers(10, start+1, 1000)
 	errorsCh := make(chan peerError, 1000)
 	requestsCh := make(chan BlockRequest, 1000)
-	pool := NewBlockPool(log.TestingLogger(), start, requestsCh, errorsCh)
+	pool := NewBlockPool(log.NewNopLogger(), start, requestsCh, errorsCh)
 
-	err := pool.Start()
-	if err != nil {
+	if err := pool.Start(ctx); err != nil {
 		t.Error(err)
 	}
 
-	t.Cleanup(func() {
-		if err := pool.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
+	t.Cleanup(func() { cancel(); pool.Wait() })
 
 	peers.start()
 	defer peers.stop()
@@ -126,7 +125,6 @@ func TestBlockPoolBasic(t *testing.T) {
 		case err := <-errorsCh:
 			t.Error(err)
 		case request := <-requestsCh:
-			t.Logf("Pulled new BlockRequest %v", request)
 			if request.Height == 300 {
 				return // Done!
 			}
@@ -137,24 +135,21 @@ func TestBlockPoolBasic(t *testing.T) {
 }
 
 func TestBlockPoolTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := log.NewNopLogger()
+
 	start := int64(42)
 	peers := makePeers(10, start+1, 1000)
 	errorsCh := make(chan peerError, 1000)
 	requestsCh := make(chan BlockRequest, 1000)
-	pool := NewBlockPool(log.TestingLogger(), start, requestsCh, errorsCh)
-	err := pool.Start()
+	pool := NewBlockPool(logger, start, requestsCh, errorsCh)
+	err := pool.Start(ctx)
 	if err != nil {
 		t.Error(err)
 	}
-	t.Cleanup(func() {
-		if err := pool.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
-
-	for _, peer := range peers {
-		t.Logf("Peer %v", peer.id)
-	}
+	t.Cleanup(func() { cancel(); pool.Wait() })
 
 	// Introduce each peer.
 	go func() {
@@ -184,7 +179,6 @@ func TestBlockPoolTimeout(t *testing.T) {
 	for {
 		select {
 		case err := <-errorsCh:
-			t.Log(err)
 			// consider error to be always timeout here
 			if _, ok := timedOut[err.peerID]; !ok {
 				counter++
@@ -193,12 +187,17 @@ func TestBlockPoolTimeout(t *testing.T) {
 				}
 			}
 		case request := <-requestsCh:
-			t.Logf("Pulled new BlockRequest %+v", request)
+			logger.Debug("received request",
+				"counter", counter,
+				"request", request)
 		}
 	}
 }
 
 func TestBlockPoolRemovePeer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	peers := make(testPeers, 10)
 	for i := 0; i < 10; i++ {
 		peerID := types.NodeID(fmt.Sprintf("%d", i+1))
@@ -208,14 +207,10 @@ func TestBlockPoolRemovePeer(t *testing.T) {
 	requestsCh := make(chan BlockRequest)
 	errorsCh := make(chan peerError)
 
-	pool := NewBlockPool(log.TestingLogger(), 1, requestsCh, errorsCh)
-	err := pool.Start()
+	pool := NewBlockPool(log.NewNopLogger(), 1, requestsCh, errorsCh)
+	err := pool.Start(ctx)
 	require.NoError(t, err)
-	t.Cleanup(func() {
-		if err := pool.Stop(); err != nil {
-			t.Error(err)
-		}
-	})
+	t.Cleanup(func() { cancel(); pool.Wait() })
 
 	// add peers
 	for peerID, peer := range peers {

@@ -2,6 +2,7 @@ package light_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -57,16 +58,25 @@ func (impl *providerBenchmarkImpl) LightBlock(ctx context.Context, height int64)
 }
 
 func (impl *providerBenchmarkImpl) ReportEvidence(_ context.Context, _ types.Evidence) error {
-	panic("not implemented")
+	return errors.New("not implemented")
 }
 
+// provierBenchmarkImpl does not have an ID iteself.
+// Thus we return a sample string
+func (impl *providerBenchmarkImpl) ID() string { return "ip-not-defined.com" }
+
 func BenchmarkSequence(b *testing.B) {
-	headers, vals, _ := genLightBlocksWithKeys(chainID, 1000, 100, 1, bTime)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	headers, vals, _ := genLightBlocksWithKeys(b, chainID, 1000, 100, 1, bTime)
 	benchmarkFullNode := newProviderBenchmarkImpl(headers, vals)
-	genesisBlock, _ := benchmarkFullNode.LightBlock(context.Background(), 1)
+	genesisBlock, _ := benchmarkFullNode.LightBlock(ctx, 1)
+
+	logger := log.NewTestingLogger(b)
 
 	c, err := light.NewClient(
-		context.Background(),
+		ctx,
 		chainID,
 		light.TrustOptions{
 			Period: 24 * time.Hour,
@@ -74,9 +84,9 @@ func BenchmarkSequence(b *testing.B) {
 			Hash:   genesisBlock.Hash(),
 		},
 		benchmarkFullNode,
-		[]provider.Provider{benchmarkFullNode},
+		nil,
 		dbs.New(dbm.NewMemDB()),
-		light.Logger(log.TestingLogger()),
+		light.Logger(logger),
 		light.SequentialVerification(),
 	)
 	if err != nil {
@@ -85,7 +95,7 @@ func BenchmarkSequence(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		_, err = c.VerifyLightBlockAtHeight(context.Background(), 1000, bTime.Add(1000*time.Minute))
+		_, err = c.VerifyLightBlockAtHeight(ctx, 1000, bTime.Add(1000*time.Minute))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -93,9 +103,14 @@ func BenchmarkSequence(b *testing.B) {
 }
 
 func BenchmarkBisection(b *testing.B) {
-	headers, vals, _ := genLightBlocksWithKeys(chainID, 1000, 100, 1, bTime)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	headers, vals, _ := genLightBlocksWithKeys(b, chainID, 1000, 100, 1, bTime)
 	benchmarkFullNode := newProviderBenchmarkImpl(headers, vals)
-	genesisBlock, _ := benchmarkFullNode.LightBlock(context.Background(), 1)
+	genesisBlock, _ := benchmarkFullNode.LightBlock(ctx, 1)
+
+	logger := log.NewTestingLogger(b)
 
 	c, err := light.NewClient(
 		context.Background(),
@@ -106,9 +121,9 @@ func BenchmarkBisection(b *testing.B) {
 			Hash:   genesisBlock.Hash(),
 		},
 		benchmarkFullNode,
-		[]provider.Provider{benchmarkFullNode},
+		nil,
 		dbs.New(dbm.NewMemDB()),
-		light.Logger(log.TestingLogger()),
+		light.Logger(logger),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -116,7 +131,7 @@ func BenchmarkBisection(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		_, err = c.VerifyLightBlockAtHeight(context.Background(), 1000, bTime.Add(1000*time.Minute))
+		_, err = c.VerifyLightBlockAtHeight(ctx, 1000, bTime.Add(1000*time.Minute))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -124,12 +139,17 @@ func BenchmarkBisection(b *testing.B) {
 }
 
 func BenchmarkBackwards(b *testing.B) {
-	headers, vals, _ := genLightBlocksWithKeys(chainID, 1000, 100, 1, bTime)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	headers, vals, _ := genLightBlocksWithKeys(b, chainID, 1000, 100, 1, bTime)
 	benchmarkFullNode := newProviderBenchmarkImpl(headers, vals)
-	trustedBlock, _ := benchmarkFullNode.LightBlock(context.Background(), 0)
+	trustedBlock, _ := benchmarkFullNode.LightBlock(ctx, 0)
+
+	logger := log.NewTestingLogger(b)
 
 	c, err := light.NewClient(
-		context.Background(),
+		ctx,
 		chainID,
 		light.TrustOptions{
 			Period: 24 * time.Hour,
@@ -137,9 +157,9 @@ func BenchmarkBackwards(b *testing.B) {
 			Hash:   trustedBlock.Hash(),
 		},
 		benchmarkFullNode,
-		[]provider.Provider{benchmarkFullNode},
+		nil,
 		dbs.New(dbm.NewMemDB()),
-		light.Logger(log.TestingLogger()),
+		light.Logger(logger),
 	)
 	if err != nil {
 		b.Fatal(err)
@@ -147,9 +167,10 @@ func BenchmarkBackwards(b *testing.B) {
 	b.ResetTimer()
 
 	for n := 0; n < b.N; n++ {
-		_, err = c.VerifyLightBlockAtHeight(context.Background(), 1, bTime)
+		_, err = c.VerifyLightBlockAtHeight(ctx, 1, bTime)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
+
 }

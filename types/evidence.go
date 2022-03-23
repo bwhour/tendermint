@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -13,7 +14,8 @@ import (
 	abci "github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/crypto/merkle"
 	"github.com/tendermint/tendermint/crypto/tmhash"
-	tmjson "github.com/tendermint/tendermint/libs/json"
+	"github.com/tendermint/tendermint/internal/jsontypes"
+	tmmath "github.com/tendermint/tendermint/libs/math"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 )
@@ -28,6 +30,9 @@ type Evidence interface {
 	String() string        // string format of the evidence
 	Time() time.Time       // time of the infraction
 	ValidateBasic() error  // basic consistency check
+
+	// Implementations must support tagged encoding in JSON.
+	jsontypes.Tagged
 }
 
 //--------------------------------------------------------------------------------------
@@ -38,10 +43,13 @@ type DuplicateVoteEvidence struct {
 	VoteB *Vote `json:"vote_b"`
 
 	// abci specific information
-	TotalVotingPower int64
-	ValidatorPower   int64
+	TotalVotingPower int64 `json:",string"`
+	ValidatorPower   int64 `json:",string"`
 	Timestamp        time.Time
 }
+
+// TypeTag implements the jsontypes.Tagged interface.
+func (*DuplicateVoteEvidence) TypeTag() string { return "tendermint/DuplicateVoteEvidence" }
 
 var _ Evidence = &DuplicateVoteEvidence{}
 
@@ -236,13 +244,16 @@ func DuplicateVoteEvidenceFromProto(pb *tmproto.DuplicateVoteEvidence) (*Duplica
 // height, then nodes will treat this as of the Lunatic form, else it is of the Equivocation form.
 type LightClientAttackEvidence struct {
 	ConflictingBlock *LightBlock
-	CommonHeight     int64
+	CommonHeight     int64 `json:",string"`
 
 	// abci specific information
 	ByzantineValidators []*Validator // validators in the validator set that misbehaved in creating the conflicting block
-	TotalVotingPower    int64        // total voting power of the validator set at the common height
+	TotalVotingPower    int64        `json:",string"` // total voting power of the validator set at the common height
 	Timestamp           time.Time    // timestamp of the block at the common height
 }
+
+// TypeTag implements the jsontypes.Tagged interface.
+func (*LightClientAttackEvidence) TypeTag() string { return "tendermint/LightClientAttackEvidence" }
 
 var _ Evidence = &LightClientAttackEvidence{}
 
@@ -365,10 +376,10 @@ func (l *LightClientAttackEvidence) Height() int64 {
 // String returns a string representation of LightClientAttackEvidence
 func (l *LightClientAttackEvidence) String() string {
 	return fmt.Sprintf(`LightClientAttackEvidence{
-		ConflictingBlock: %v, 
-		CommonHeight: %d, 
-		ByzatineValidators: %v, 
-		TotalVotingPower: %d, 
+		ConflictingBlock: %v,
+		CommonHeight: %d,
+		ByzatineValidators: %v,
+		TotalVotingPower: %d,
 		Timestamp: %v}#%X`,
 		l.ConflictingBlock.String(), l.CommonHeight, l.ByzantineValidators,
 		l.TotalVotingPower, l.Timestamp, l.Hash())
@@ -544,6 +555,100 @@ func LightClientAttackEvidenceFromProto(lpb *tmproto.LightClientAttackEvidence) 
 // EvidenceList is a list of Evidence. Evidences is not a word.
 type EvidenceList []Evidence
 
+// StringIndented returns a string representation of the evidence.
+func (evl EvidenceList) StringIndented(indent string) string {
+	if evl == nil {
+		return "nil-Evidence"
+	}
+	evStrings := make([]string, tmmath.MinInt(len(evl), 21))
+	for i, ev := range evl {
+		if i == 20 {
+			evStrings[i] = fmt.Sprintf("... (%v total)", len(evl))
+			break
+		}
+		evStrings[i] = fmt.Sprintf("Evidence:%v", ev)
+	}
+	return fmt.Sprintf(`EvidenceList{
+%s  %v
+%s}#%v`,
+		indent, strings.Join(evStrings, "\n"+indent+"  "),
+		indent, evl.Hash())
+}
+
+// ByteSize returns the total byte size of all the evidence
+func (evl EvidenceList) ByteSize() int64 {
+	if len(evl) != 0 {
+		pb, err := evl.ToProto()
+		if err != nil {
+			panic(err)
+		}
+		return int64(pb.Size())
+	}
+	return 0
+}
+
+// FromProto sets a protobuf EvidenceList to the given pointer.
+func (evl *EvidenceList) FromProto(eviList *tmproto.EvidenceList) error {
+	if eviList == nil {
+		return errors.New("nil evidence list")
+	}
+
+	eviBzs := make(EvidenceList, len(eviList.Evidence))
+	for i := range eviList.Evidence {
+		evi, err := EvidenceFromProto(&eviList.Evidence[i])
+		if err != nil {
+			return err
+		}
+		eviBzs[i] = evi
+	}
+	*evl = eviBzs
+	return nil
+}
+
+// ToProto converts EvidenceList to protobuf
+func (evl *EvidenceList) ToProto() (*tmproto.EvidenceList, error) {
+	if evl == nil {
+		return nil, errors.New("nil evidence list")
+	}
+
+	eviBzs := make([]tmproto.Evidence, len(*evl))
+	for i, v := range *evl {
+		protoEvi, err := EvidenceToProto(v)
+		if err != nil {
+			return nil, err
+		}
+		eviBzs[i] = *protoEvi
+	}
+	return &tmproto.EvidenceList{Evidence: eviBzs}, nil
+}
+
+func (evl EvidenceList) MarshalJSON() ([]byte, error) {
+	lst := make([]json.RawMessage, len(evl))
+	for i, ev := range evl {
+		bits, err := jsontypes.Marshal(ev)
+		if err != nil {
+			return nil, err
+		}
+		lst[i] = bits
+	}
+	return json.Marshal(lst)
+}
+
+func (evl *EvidenceList) UnmarshalJSON(data []byte) error {
+	var lst []json.RawMessage
+	if err := json.Unmarshal(data, &lst); err != nil {
+		return err
+	}
+	out := make([]Evidence, len(lst))
+	for i, elt := range lst {
+		if err := jsontypes.Unmarshal(elt, &out[i]); err != nil {
+			return err
+		}
+	}
+	*evl = EvidenceList(out)
+	return nil
+}
+
 // Hash returns the simple merkle root hash of the EvidenceList.
 func (evl EvidenceList) Hash() []byte {
 	// These allocations are required because Evidence is not of type Bytes, and
@@ -574,6 +679,16 @@ func (evl EvidenceList) Has(evidence Evidence) bool {
 		}
 	}
 	return false
+}
+
+// ToABCI converts the evidence list to a slice of the ABCI protobuf messages
+// for use when communicating the evidence to an application.
+func (evl EvidenceList) ToABCI() []abci.Evidence {
+	var el []abci.Evidence
+	for _, e := range evl {
+		el = append(el, e.ABCI()...)
+	}
+	return el
 }
 
 //------------------------------------------ PROTO --------------------------------------
@@ -628,8 +743,8 @@ func EvidenceFromProto(evidence *tmproto.Evidence) (Evidence, error) {
 }
 
 func init() {
-	tmjson.RegisterType(&DuplicateVoteEvidence{}, "tendermint/DuplicateVoteEvidence")
-	tmjson.RegisterType(&LightClientAttackEvidence{}, "tendermint/LightClientAttackEvidence")
+	jsontypes.MustRegister((*DuplicateVoteEvidence)(nil))
+	jsontypes.MustRegister((*LightClientAttackEvidence)(nil))
 }
 
 //-------------------------------------------- ERRORS --------------------------------------
@@ -671,29 +786,32 @@ func (err *ErrEvidenceOverflow) Error() string {
 // unstable - use only for testing
 
 // assumes the round to be 0 and the validator index to be 0
-func NewMockDuplicateVoteEvidence(height int64, time time.Time, chainID string) *DuplicateVoteEvidence {
+func NewMockDuplicateVoteEvidence(ctx context.Context, height int64, time time.Time, chainID string) (*DuplicateVoteEvidence, error) {
 	val := NewMockPV()
-	return NewMockDuplicateVoteEvidenceWithValidator(height, time, val, chainID)
+	return NewMockDuplicateVoteEvidenceWithValidator(ctx, height, time, val, chainID)
 }
 
 // assumes voting power to be 10 and validator to be the only one in the set
-func NewMockDuplicateVoteEvidenceWithValidator(height int64, time time.Time,
-	pv PrivValidator, chainID string) *DuplicateVoteEvidence {
-	pubKey, _ := pv.GetPubKey(context.Background())
+func NewMockDuplicateVoteEvidenceWithValidator(ctx context.Context, height int64, time time.Time, pv PrivValidator, chainID string) (*DuplicateVoteEvidence, error) {
+	pubKey, err := pv.GetPubKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	val := NewValidator(pubKey, 10)
 	voteA := makeMockVote(height, 0, 0, pubKey.Address(), randBlockID(), time)
 	vA := voteA.ToProto()
-	_ = pv.SignVote(context.Background(), chainID, vA)
+	_ = pv.SignVote(ctx, chainID, vA)
 	voteA.Signature = vA.Signature
 	voteB := makeMockVote(height, 0, 0, pubKey.Address(), randBlockID(), time)
 	vB := voteB.ToProto()
-	_ = pv.SignVote(context.Background(), chainID, vB)
+	_ = pv.SignVote(ctx, chainID, vB)
 	voteB.Signature = vB.Signature
 	ev, err := NewDuplicateVoteEvidence(voteA, voteB, time, NewValidatorSet([]*Validator{val}))
 	if err != nil {
-		panic("constructing mock duplicate vote evidence: " + err.Error())
+		return nil, fmt.Errorf("constructing mock duplicate vote evidence: %w", err)
 	}
-	return ev
+	return ev, nil
 }
 
 func makeMockVote(height int64, round, index int32, addr Address,

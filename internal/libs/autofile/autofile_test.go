@@ -1,6 +1,7 @@
 package autofile
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -12,6 +13,9 @@ import (
 )
 
 func TestSIGHUP(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	origDir, err := os.Getwd()
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -21,16 +25,12 @@ func TestSIGHUP(t *testing.T) {
 	})
 
 	// First, create a temporary directory and move into it
-	dir, err := os.MkdirTemp("", "sighup_test")
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_ = os.RemoveAll(dir)
-	})
+	dir := t.TempDir()
 	require.NoError(t, os.Chdir(dir))
 
 	// Create an AutoFile in the temporary directory
 	name := "sighup_test"
-	af, err := OpenAutoFile(name)
+	af, err := OpenAutoFile(ctx, name)
 	require.NoError(t, err)
 	require.True(t, filepath.IsAbs(af.Path))
 
@@ -44,9 +44,7 @@ func TestSIGHUP(t *testing.T) {
 	require.NoError(t, os.Rename(name, name+"_old"))
 
 	// Move into a different temporary directory
-	otherDir, err := os.MkdirTemp("", "sighup_test_other")
-	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(otherDir) })
+	otherDir := t.TempDir()
 	require.NoError(t, os.Chdir(otherDir))
 
 	// Send SIGHUP to self.
@@ -104,13 +102,16 @@ func TestSIGHUP(t *testing.T) {
 // }
 
 func TestAutoFileSize(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// First, create an AutoFile writing to a tempfile dir
-	f, err := os.CreateTemp("", "sighup_test")
+	f, err := os.CreateTemp(t.TempDir(), "sighup_test")
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
 
 	// Here is the actual AutoFile.
-	af, err := OpenAutoFile(f.Name())
+	af, err := OpenAutoFile(ctx, f.Name())
 	require.NoError(t, err)
 
 	// 1. Empty file
@@ -127,7 +128,7 @@ func TestAutoFileSize(t *testing.T) {
 	require.NoError(t, err)
 
 	// 3. Not existing file
-	require.NoError(t, af.Close())
+	require.NoError(t, af.closeFile())
 	require.NoError(t, os.Remove(f.Name()))
 	size, err = af.Size()
 	require.EqualValues(t, 0, size, "Expected a new file to be empty")

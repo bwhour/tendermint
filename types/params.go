@@ -41,6 +41,8 @@ type ConsensusParams struct {
 	Evidence  EvidenceParams  `json:"evidence"`
 	Validator ValidatorParams `json:"validator"`
 	Version   VersionParams   `json:"version"`
+	Synchrony SynchronyParams `json:"synchrony"`
+	Timeout   TimeoutParams   `json:"timeout"`
 }
 
 // HashedParams is a subset of ConsensusParams.
@@ -54,15 +56,15 @@ type HashedParams struct {
 // BlockParams define limits on the block size and gas plus minimum time
 // between blocks.
 type BlockParams struct {
-	MaxBytes int64 `json:"max_bytes"`
-	MaxGas   int64 `json:"max_gas"`
+	MaxBytes int64 `json:"max_bytes,string"`
+	MaxGas   int64 `json:"max_gas,string"`
 }
 
 // EvidenceParams determine how we handle evidence of malfeasance.
 type EvidenceParams struct {
-	MaxAgeNumBlocks int64         `json:"max_age_num_blocks"` // only accept new evidence more recent than this
-	MaxAgeDuration  time.Duration `json:"max_age_duration"`
-	MaxBytes        int64         `json:"max_bytes"`
+	MaxAgeNumBlocks int64         `json:"max_age_num_blocks,string"` // only accept new evidence more recent than this
+	MaxAgeDuration  time.Duration `json:"max_age_duration,string"`
+	MaxBytes        int64         `json:"max_bytes,string"`
 }
 
 // ValidatorParams restrict the public key types validators can use.
@@ -72,7 +74,26 @@ type ValidatorParams struct {
 }
 
 type VersionParams struct {
-	AppVersion uint64 `json:"app_version"`
+	AppVersion uint64 `json:"app_version,string"`
+}
+
+// SynchronyParams influence the validity of block timestamps.
+// For more information on the relationship of the synchrony parameters to
+// block validity, see the Proposer-Based Timestamps specification:
+// https://github.com/tendermint/tendermint/blob/master/spec/consensus/proposer-based-timestamp/README.md
+type SynchronyParams struct {
+	Precision    time.Duration `json:"precision,string"`
+	MessageDelay time.Duration `json:"message_delay,string"`
+}
+
+// TimeoutParams configure the timings of the steps of the Tendermint consensus algorithm.
+type TimeoutParams struct {
+	Propose             time.Duration `json:"propose,string"`
+	ProposeDelta        time.Duration `json:"propose_delta,string"`
+	Vote                time.Duration `json:"vote,string"`
+	VoteDelta           time.Duration `json:"vote_delta,string"`
+	Commit              time.Duration `json:"commit,string"`
+	BypassCommitTimeout bool          `json:"bypass_commit_timeout"`
 }
 
 // DefaultConsensusParams returns a default ConsensusParams.
@@ -82,6 +103,8 @@ func DefaultConsensusParams() *ConsensusParams {
 		Evidence:  DefaultEvidenceParams(),
 		Validator: DefaultValidatorParams(),
 		Version:   DefaultVersionParams(),
+		Synchrony: DefaultSynchronyParams(),
+		Timeout:   DefaultTimeoutParams(),
 	}
 }
 
@@ -116,6 +139,28 @@ func DefaultVersionParams() VersionParams {
 	}
 }
 
+func DefaultSynchronyParams() SynchronyParams {
+	return SynchronyParams{
+		// 505ms was selected as the default to enable chains that have validators in
+		// mixed leap-second handling environments.
+		// For more information, see: https://github.com/tendermint/tendermint/issues/7724
+		Precision:    505 * time.Millisecond,
+		MessageDelay: 12 * time.Second,
+	}
+
+}
+
+func DefaultTimeoutParams() TimeoutParams {
+	return TimeoutParams{
+		Propose:             3000 * time.Millisecond,
+		ProposeDelta:        500 * time.Millisecond,
+		Vote:                1000 * time.Millisecond,
+		VoteDelta:           500 * time.Millisecond,
+		Commit:              1000 * time.Millisecond,
+		BypassCommitTimeout: false,
+	}
+}
+
 func (val *ValidatorParams) IsValidPubkeyType(pubkeyType string) bool {
 	for i := 0; i < len(val.PubKeyTypes); i++ {
 		if val.PubKeyTypes[i] == pubkeyType {
@@ -123,6 +168,15 @@ func (val *ValidatorParams) IsValidPubkeyType(pubkeyType string) bool {
 		}
 	}
 	return false
+}
+
+func (params *ConsensusParams) Complete() {
+	if params.Synchrony == (SynchronyParams{}) {
+		params.Synchrony = DefaultSynchronyParams()
+	}
+	if params.Timeout == (TimeoutParams{}) {
+		params.Timeout = DefaultTimeoutParams()
+	}
 }
 
 // Validate validates the ConsensusParams to ensure all values are within their
@@ -148,7 +202,7 @@ func (params ConsensusParams) ValidateConsensusParams() error {
 	}
 
 	if params.Evidence.MaxAgeDuration <= 0 {
-		return fmt.Errorf("evidence.MaxAgeDuration must be grater than 0 if provided, Got %v",
+		return fmt.Errorf("evidence.MaxAgeDuration must be greater than 0 if provided, Got %v",
 			params.Evidence.MaxAgeDuration)
 	}
 
@@ -160,6 +214,36 @@ func (params ConsensusParams) ValidateConsensusParams() error {
 	if params.Evidence.MaxBytes < 0 {
 		return fmt.Errorf("evidence.MaxBytes must be non negative. Got: %d",
 			params.Evidence.MaxBytes)
+	}
+
+	if params.Synchrony.MessageDelay <= 0 {
+		return fmt.Errorf("synchrony.MessageDelay must be greater than 0. Got: %d",
+			params.Synchrony.MessageDelay)
+	}
+
+	if params.Synchrony.Precision <= 0 {
+		return fmt.Errorf("synchrony.Precision must be greater than 0. Got: %d",
+			params.Synchrony.Precision)
+	}
+
+	if params.Timeout.Propose < 0 {
+		return fmt.Errorf("timeout.ProposeDelta must not be negative. Got: %d", params.Timeout.Propose)
+	}
+
+	if params.Timeout.ProposeDelta < 0 {
+		return fmt.Errorf("timeout.ProposeDelta must not be negative. Got: %d", params.Timeout.ProposeDelta)
+	}
+
+	if params.Timeout.Vote < 0 {
+		return fmt.Errorf("timeout.Vote must not be negative. Got: %d", params.Timeout.Vote)
+	}
+
+	if params.Timeout.VoteDelta < 0 {
+		return fmt.Errorf("timeout.VoteDelta must not be negative. Got: %d", params.Timeout.VoteDelta)
+	}
+
+	if params.Timeout.Commit < 0 {
+		return fmt.Errorf("timeout.Commit must not be negative. Got: %d", params.Timeout.Commit)
 	}
 
 	if len(params.Validator.PubKeyTypes) == 0 {
@@ -205,6 +289,9 @@ func (params ConsensusParams) HashConsensusParams() []byte {
 func (params *ConsensusParams) Equals(params2 *ConsensusParams) bool {
 	return params.Block == params2.Block &&
 		params.Evidence == params2.Evidence &&
+		params.Version == params2.Version &&
+		params.Synchrony == params2.Synchrony &&
+		params.Timeout == params2.Timeout &&
 		tmstrings.StringSliceEqual(params.Validator.PubKeyTypes, params2.Validator.PubKeyTypes)
 }
 
@@ -235,6 +322,32 @@ func (params ConsensusParams) UpdateConsensusParams(params2 *tmproto.ConsensusPa
 	if params2.Version != nil {
 		res.Version.AppVersion = params2.Version.AppVersion
 	}
+	if params2.Synchrony != nil {
+		if params2.Synchrony.MessageDelay != nil {
+			res.Synchrony.MessageDelay = *params2.Synchrony.GetMessageDelay()
+		}
+		if params2.Synchrony.Precision != nil {
+			res.Synchrony.Precision = *params2.Synchrony.GetPrecision()
+		}
+	}
+	if params2.Timeout != nil {
+		if params2.Timeout.Propose != nil {
+			res.Timeout.Propose = *params2.Timeout.GetPropose()
+		}
+		if params2.Timeout.ProposeDelta != nil {
+			res.Timeout.ProposeDelta = *params2.Timeout.GetProposeDelta()
+		}
+		if params2.Timeout.Vote != nil {
+			res.Timeout.Vote = *params2.Timeout.GetVote()
+		}
+		if params2.Timeout.VoteDelta != nil {
+			res.Timeout.VoteDelta = *params2.Timeout.GetVoteDelta()
+		}
+		if params2.Timeout.Commit != nil {
+			res.Timeout.Commit = *params2.Timeout.GetCommit()
+		}
+		res.Timeout.BypassCommitTimeout = params2.Timeout.GetBypassCommitTimeout()
+	}
 	return res
 }
 
@@ -255,11 +368,23 @@ func (params *ConsensusParams) ToProto() tmproto.ConsensusParams {
 		Version: &tmproto.VersionParams{
 			AppVersion: params.Version.AppVersion,
 		},
+		Synchrony: &tmproto.SynchronyParams{
+			MessageDelay: &params.Synchrony.MessageDelay,
+			Precision:    &params.Synchrony.Precision,
+		},
+		Timeout: &tmproto.TimeoutParams{
+			Propose:             &params.Timeout.Propose,
+			ProposeDelta:        &params.Timeout.ProposeDelta,
+			Vote:                &params.Timeout.Vote,
+			VoteDelta:           &params.Timeout.VoteDelta,
+			Commit:              &params.Timeout.Commit,
+			BypassCommitTimeout: params.Timeout.BypassCommitTimeout,
+		},
 	}
 }
 
 func ConsensusParamsFromProto(pbParams tmproto.ConsensusParams) ConsensusParams {
-	return ConsensusParams{
+	c := ConsensusParams{
 		Block: BlockParams{
 			MaxBytes: pbParams.Block.MaxBytes,
 			MaxGas:   pbParams.Block.MaxGas,
@@ -276,4 +401,31 @@ func ConsensusParamsFromProto(pbParams tmproto.ConsensusParams) ConsensusParams 
 			AppVersion: pbParams.Version.AppVersion,
 		},
 	}
+	if pbParams.Synchrony != nil {
+		if pbParams.Synchrony.MessageDelay != nil {
+			c.Synchrony.MessageDelay = *pbParams.Synchrony.GetMessageDelay()
+		}
+		if pbParams.Synchrony.Precision != nil {
+			c.Synchrony.Precision = *pbParams.Synchrony.GetPrecision()
+		}
+	}
+	if pbParams.Timeout != nil {
+		if pbParams.Timeout.Propose != nil {
+			c.Timeout.Propose = *pbParams.Timeout.GetPropose()
+		}
+		if pbParams.Timeout.ProposeDelta != nil {
+			c.Timeout.ProposeDelta = *pbParams.Timeout.GetProposeDelta()
+		}
+		if pbParams.Timeout.Vote != nil {
+			c.Timeout.Vote = *pbParams.Timeout.GetVote()
+		}
+		if pbParams.Timeout.VoteDelta != nil {
+			c.Timeout.VoteDelta = *pbParams.Timeout.GetVoteDelta()
+		}
+		if pbParams.Timeout.Commit != nil {
+			c.Timeout.Commit = *pbParams.Timeout.GetCommit()
+		}
+		c.Timeout.BypassCommitTimeout = pbParams.Timeout.BypassCommitTimeout
+	}
+	return c
 }

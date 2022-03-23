@@ -44,10 +44,10 @@ type MConnTransport struct {
 	options      MConnTransportOptions
 	mConnConfig  conn.MConnConfig
 	channelDescs []*ChannelDescriptor
-	closeCh      chan struct{}
-	closeOnce    sync.Once
 
-	listener net.Listener
+	closeOnce sync.Once
+	doneCh    chan struct{}
+	listener  net.Listener
 }
 
 // NewMConnTransport sets up a new MConnection transport. This uses the
@@ -63,7 +63,7 @@ func NewMConnTransport(
 		logger:       logger,
 		options:      options,
 		mConnConfig:  mConnConfig,
-		closeCh:      make(chan struct{}),
+		doneCh:       make(chan struct{}),
 		channelDescs: channelDescs,
 	}
 }
@@ -84,10 +84,11 @@ func (m *MConnTransport) Endpoints() []Endpoint {
 		return []Endpoint{}
 	}
 	select {
-	case <-m.closeCh:
+	case <-m.doneCh:
 		return []Endpoint{}
 	default:
 	}
+
 	endpoint := Endpoint{
 		Protocol: MConnProtocol,
 	}
@@ -132,22 +133,40 @@ func (m *MConnTransport) Listen(endpoint Endpoint) error {
 }
 
 // Accept implements Transport.
-func (m *MConnTransport) Accept() (Connection, error) {
+func (m *MConnTransport) Accept(ctx context.Context) (Connection, error) {
 	if m.listener == nil {
 		return nil, errors.New("transport is not listening")
 	}
 
-	tcpConn, err := m.listener.Accept()
-	if err != nil {
-		select {
-		case <-m.closeCh:
-			return nil, io.EOF
-		default:
-			return nil, err
+	conCh := make(chan net.Conn)
+	errCh := make(chan error)
+	go func() {
+		tcpConn, err := m.listener.Accept()
+		if err != nil {
+			select {
+			case errCh <- err:
+			case <-ctx.Done():
+			}
 		}
+		select {
+		case conCh <- tcpConn:
+		case <-ctx.Done():
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		m.listener.Close()
+		return nil, io.EOF
+	case <-m.doneCh:
+		m.listener.Close()
+		return nil, io.EOF
+	case err := <-errCh:
+		return nil, err
+	case tcpConn := <-conCh:
+		return newMConnConnection(m.logger, tcpConn, m.mConnConfig, m.channelDescs), nil
 	}
 
-	return newMConnConnection(m.logger, tcpConn, m.mConnConfig, m.channelDescs), nil
 }
 
 // Dial implements Transport.
@@ -178,7 +197,7 @@ func (m *MConnTransport) Dial(ctx context.Context, endpoint Endpoint) (Connectio
 func (m *MConnTransport) Close() error {
 	var err error
 	m.closeOnce.Do(func() {
-		close(m.closeCh) // must be closed first, to handle error in Accept()
+		close(m.doneCh)
 		if m.listener != nil {
 			err = m.listener.Close()
 		}
@@ -222,7 +241,7 @@ type mConnConnection struct {
 	channelDescs []*ChannelDescriptor
 	receiveCh    chan mConnMessage
 	errorCh      chan error
-	closeCh      chan struct{}
+	doneCh       chan struct{}
 	closeOnce    sync.Once
 
 	mconn *conn.MConnection // set during Handshake()
@@ -248,7 +267,7 @@ func newMConnConnection(
 		channelDescs: channelDescs,
 		receiveCh:    make(chan mConnMessage),
 		errorCh:      make(chan error, 1), // buffered to avoid onError leak
-		closeCh:      make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}
 }
 
@@ -277,7 +296,12 @@ func (c *mConnConnection) Handshake(
 		}()
 		var err error
 		mconn, peerInfo, peerKey, err = c.handshake(ctx, nodeInfo, privKey)
-		errCh <- err
+
+		select {
+		case errCh <- err:
+		case <-ctx.Done():
+		}
+
 	}()
 
 	select {
@@ -290,8 +314,7 @@ func (c *mConnConnection) Handshake(
 			return types.NodeInfo{}, nil, err
 		}
 		c.mconn = mconn
-		c.logger = mconn.Logger
-		if err = c.mconn.Start(); err != nil {
+		if err = c.mconn.Start(ctx); err != nil {
 			return types.NodeInfo{}, nil, err
 		}
 		return peerInfo, peerKey, nil
@@ -315,27 +338,45 @@ func (c *mConnConnection) handshake(
 		return nil, types.NodeInfo{}, nil, err
 	}
 
+	wg := &sync.WaitGroup{}
 	var pbPeerInfo p2pproto.NodeInfo
 	errCh := make(chan error, 2)
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		_, err := protoio.NewDelimitedWriter(secretConn).WriteMsg(nodeInfo.ToProto())
-		errCh <- err
-	}()
-	go func() {
-		_, err := protoio.NewDelimitedReader(secretConn, types.MaxNodeInfoSize()).ReadMsg(&pbPeerInfo)
-		errCh <- err
-	}()
-	for i := 0; i < cap(errCh); i++ {
-		if err = <-errCh; err != nil {
-			return nil, types.NodeInfo{}, nil, err
+		select {
+		case errCh <- err:
+		case <-ctx.Done():
 		}
+
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := protoio.NewDelimitedReader(secretConn, types.MaxNodeInfoSize()).ReadMsg(&pbPeerInfo)
+		select {
+		case errCh <- err:
+		case <-ctx.Done():
+		}
+	}()
+
+	wg.Wait()
+
+	if err, ok := <-errCh; ok && err != nil {
+		return nil, types.NodeInfo{}, nil, err
 	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, types.NodeInfo{}, nil, err
+	}
+
 	peerInfo, err := types.NodeInfoFromProto(&pbPeerInfo)
 	if err != nil {
 		return nil, types.NodeInfo{}, nil, err
 	}
 
-	mconn := conn.NewMConnectionWithConfig(
+	mconn := conn.NewMConnection(
 		c.logger.With("peer", c.RemoteEndpoint().NodeAddress(peerInfo.NodeID)),
 		secretConn,
 		c.channelDescs,
@@ -348,16 +389,16 @@ func (c *mConnConnection) handshake(
 }
 
 // onReceive is a callback for MConnection received messages.
-func (c *mConnConnection) onReceive(chID ChannelID, payload []byte) {
+func (c *mConnConnection) onReceive(ctx context.Context, chID ChannelID, payload []byte) {
 	select {
 	case c.receiveCh <- mConnMessage{channelID: chID, payload: payload}:
-	case <-c.closeCh:
+	case <-ctx.Done():
 	}
 }
 
 // onError is a callback for MConnection errors. The error is passed via errorCh
 // to ReceiveMessage (but not SendMessage, for legacy P2P stack behavior).
-func (c *mConnConnection) onError(e interface{}) {
+func (c *mConnConnection) onError(ctx context.Context, e interface{}) {
 	err, ok := e.(error)
 	if !ok {
 		err = fmt.Errorf("%v", err)
@@ -367,7 +408,7 @@ func (c *mConnConnection) onError(e interface{}) {
 	_ = c.Close()
 	select {
 	case c.errorCh <- err:
-	case <-c.closeCh:
+	case <-ctx.Done():
 	}
 }
 
@@ -377,14 +418,14 @@ func (c *mConnConnection) String() string {
 }
 
 // SendMessage implements Connection.
-func (c *mConnConnection) SendMessage(chID ChannelID, msg []byte) error {
+func (c *mConnConnection) SendMessage(ctx context.Context, chID ChannelID, msg []byte) error {
 	if chID > math.MaxUint8 {
 		return fmt.Errorf("MConnection only supports 1-byte channel IDs (got %v)", chID)
 	}
 	select {
 	case err := <-c.errorCh:
 		return err
-	case <-c.closeCh:
+	case <-ctx.Done():
 		return io.EOF
 	default:
 		if ok := c.mconn.Send(chID, msg); !ok {
@@ -396,11 +437,13 @@ func (c *mConnConnection) SendMessage(chID ChannelID, msg []byte) error {
 }
 
 // ReceiveMessage implements Connection.
-func (c *mConnConnection) ReceiveMessage() (ChannelID, []byte, error) {
+func (c *mConnConnection) ReceiveMessage(ctx context.Context) (ChannelID, []byte, error) {
 	select {
 	case err := <-c.errorCh:
 		return 0, nil, err
-	case <-c.closeCh:
+	case <-c.doneCh:
+		return 0, nil, io.EOF
+	case <-ctx.Done():
 		return 0, nil, io.EOF
 	case msg := <-c.receiveCh:
 		return msg.channelID, msg.payload, nil
@@ -435,12 +478,13 @@ func (c *mConnConnection) RemoteEndpoint() Endpoint {
 func (c *mConnConnection) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
+		defer close(c.doneCh)
+
 		if c.mconn != nil && c.mconn.IsRunning() {
-			err = c.mconn.Stop()
+			c.mconn.Stop()
 		} else {
 			err = c.conn.Close()
 		}
-		close(c.closeCh)
 	})
 	return err
 }

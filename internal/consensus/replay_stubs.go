@@ -22,26 +22,27 @@ var _ mempool.Mempool = emptyMempool{}
 func (emptyMempool) Lock()     {}
 func (emptyMempool) Unlock()   {}
 func (emptyMempool) Size() int { return 0 }
-func (emptyMempool) CheckTx(_ context.Context, _ types.Tx, _ func(*abci.Response), _ mempool.TxInfo) error {
+func (emptyMempool) CheckTx(context.Context, types.Tx, func(*abci.ResponseCheckTx), mempool.TxInfo) error {
 	return nil
 }
 func (emptyMempool) RemoveTxByKey(txKey types.TxKey) error   { return nil }
 func (emptyMempool) ReapMaxBytesMaxGas(_, _ int64) types.Txs { return types.Txs{} }
 func (emptyMempool) ReapMaxTxs(n int) types.Txs              { return types.Txs{} }
 func (emptyMempool) Update(
+	_ context.Context,
 	_ int64,
 	_ types.Txs,
-	_ []*abci.ResponseDeliverTx,
+	_ []*abci.ExecTxResult,
 	_ mempool.PreCheckFunc,
 	_ mempool.PostCheckFunc,
 ) error {
 	return nil
 }
-func (emptyMempool) Flush()                        {}
-func (emptyMempool) FlushAppConn() error           { return nil }
-func (emptyMempool) TxsAvailable() <-chan struct{} { return make(chan struct{}) }
-func (emptyMempool) EnableTxsAvailable()           {}
-func (emptyMempool) SizeBytes() int64              { return 0 }
+func (emptyMempool) Flush()                                 {}
+func (emptyMempool) FlushAppConn(ctx context.Context) error { return nil }
+func (emptyMempool) TxsAvailable() <-chan struct{}          { return make(chan struct{}) }
+func (emptyMempool) EnableTxsAvailable()                    {}
+func (emptyMempool) SizeBytes() int64                       { return 0 }
 
 func (emptyMempool) TxsFront() *clist.CElement    { return nil }
 func (emptyMempool) TxsWaitChan() <-chan struct{} { return nil }
@@ -55,17 +56,16 @@ func (emptyMempool) CloseWAL()      {}
 // Useful because we don't want to call Commit() twice for the same block on
 // the real app.
 
-func newMockProxyApp(logger log.Logger, appHash []byte, abciResponses *tmstate.ABCIResponses) proxy.AppConnConsensus {
-	clientCreator := abciclient.NewLocalCreator(&mockProxyApp{
+func newMockProxyApp(
+	ctx context.Context,
+	logger log.Logger,
+	appHash []byte,
+	abciResponses *tmstate.ABCIResponses,
+) (abciclient.Client, error) {
+	return proxy.New(abciclient.NewLocalClient(logger, &mockProxyApp{
 		appHash:       appHash,
 		abciResponses: abciResponses,
-	})
-	cli, _ := clientCreator(logger)
-	err := cli.Start()
-	if err != nil {
-		panic(err)
-	}
-	return proxy.NewAppConnConsensus(cli, proxy.NopMetrics())
+	}), logger, proxy.NopMetrics()), nil
 }
 
 type mockProxyApp struct {
@@ -76,18 +76,13 @@ type mockProxyApp struct {
 	abciResponses *tmstate.ABCIResponses
 }
 
-func (mock *mockProxyApp) DeliverTx(req abci.RequestDeliverTx) abci.ResponseDeliverTx {
-	r := mock.abciResponses.DeliverTxs[mock.txCount]
+func (mock *mockProxyApp) FinalizeBlock(req abci.RequestFinalizeBlock) abci.ResponseFinalizeBlock {
+	r := mock.abciResponses.FinalizeBlock
 	mock.txCount++
 	if r == nil {
-		return abci.ResponseDeliverTx{}
+		return abci.ResponseFinalizeBlock{}
 	}
 	return *r
-}
-
-func (mock *mockProxyApp) EndBlock(req abci.RequestEndBlock) abci.ResponseEndBlock {
-	mock.txCount = 0
-	return *mock.abciResponses.EndBlock
 }
 
 func (mock *mockProxyApp) Commit() abci.ResponseCommit {

@@ -72,29 +72,23 @@ func (app *application) CheckTx(req abci.RequestCheckTx) abci.ResponseCheckTx {
 	}
 }
 
-func setup(t testing.TB, cacheSize int, options ...TxMempoolOption) *TxMempool {
+func setup(ctx context.Context, t testing.TB, app abciclient.Client, cacheSize int, options ...TxMempoolOption) *TxMempool {
 	t.Helper()
 
-	app := &application{kvstore.NewApplication()}
-	cc := abciclient.NewLocalCreator(app)
-	logger := log.TestingLogger()
+	logger := log.NewNopLogger()
 
-	cfg, err := config.ResetTestRoot(strings.ReplaceAll(t.Name(), "/", "|"))
+	cfg, err := config.ResetTestRoot(t.TempDir(), strings.ReplaceAll(t.Name(), "/", "|"))
 	require.NoError(t, err)
 	cfg.Mempool.CacheSize = cacheSize
-	appConnMem, err := cc(logger)
-	require.NoError(t, err)
-	require.NoError(t, appConnMem.Start())
 
-	t.Cleanup(func() {
-		os.RemoveAll(cfg.RootDir)
-		require.NoError(t, appConnMem.Stop())
-	})
+	t.Cleanup(func() { os.RemoveAll(cfg.RootDir) })
 
-	return NewTxMempool(logger.With("test", t.Name()), cfg.Mempool, appConnMem, 0, options...)
+	return NewTxMempool(logger.With("test", t.Name()), cfg.Mempool, app, options...)
 }
 
-func checkTxs(t *testing.T, txmp *TxMempool, numTxs int, peerID uint16) []testTx {
+func checkTxs(ctx context.Context, t *testing.T, txmp *TxMempool, numTxs int, peerID uint16) []testTx {
+	t.Helper()
+
 	txs := make([]testTx, numTxs)
 	txInfo := TxInfo{SenderID: peerID}
 
@@ -111,7 +105,7 @@ func checkTxs(t *testing.T, txmp *TxMempool, numTxs int, peerID uint16) []testTx
 			tx:       []byte(fmt.Sprintf("sender-%d-%d=%X=%d", i, peerID, prefix, priority)),
 			priority: priority,
 		}
-		require.NoError(t, txmp.CheckTx(context.Background(), txs[i].tx, nil, txInfo))
+		require.NoError(t, txmp.CheckTx(ctx, txs[i].tx, nil, txInfo))
 	}
 
 	return txs
@@ -128,7 +122,16 @@ func convertTex(in []testTx) types.Txs {
 }
 
 func TestTxMempool_TxsAvailable(t *testing.T) {
-	txmp := setup(t, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 0)
 	txmp.EnableTxsAvailable()
 
 	ensureNoTxFire := func() {
@@ -154,7 +157,7 @@ func TestTxMempool_TxsAvailable(t *testing.T) {
 
 	// Execute CheckTx for some transactions and ensure TxsAvailable only fires
 	// once.
-	txs := checkTxs(t, txmp, 100, 0)
+	txs := checkTxs(ctx, t, txmp, 100, 0)
 	ensureTxFire()
 	ensureNoTxFire()
 
@@ -163,27 +166,36 @@ func TestTxMempool_TxsAvailable(t *testing.T) {
 		rawTxs[i] = tx.tx
 	}
 
-	responses := make([]*abci.ResponseDeliverTx, len(rawTxs[:50]))
+	responses := make([]*abci.ExecTxResult, len(rawTxs[:50]))
 	for i := 0; i < len(responses); i++ {
-		responses[i] = &abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+		responses[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
 	}
 
 	// commit half the transactions and ensure we fire an event
 	txmp.Lock()
-	require.NoError(t, txmp.Update(1, rawTxs[:50], responses, nil, nil))
+	require.NoError(t, txmp.Update(ctx, 1, rawTxs[:50], responses, nil, nil))
 	txmp.Unlock()
 	ensureTxFire()
 	ensureNoTxFire()
 
 	// Execute CheckTx for more transactions and ensure we do not fire another
 	// event as we're still on the same height (1).
-	_ = checkTxs(t, txmp, 100, 0)
+	_ = checkTxs(ctx, t, txmp, 100, 0)
 	ensureNoTxFire()
 }
 
 func TestTxMempool_Size(t *testing.T) {
-	txmp := setup(t, 0)
-	txs := checkTxs(t, txmp, 100, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 0)
+	txs := checkTxs(ctx, t, txmp, 100, 0)
 	require.Equal(t, len(txs), txmp.Size())
 	require.Equal(t, int64(5690), txmp.SizeBytes())
 
@@ -192,13 +204,13 @@ func TestTxMempool_Size(t *testing.T) {
 		rawTxs[i] = tx.tx
 	}
 
-	responses := make([]*abci.ResponseDeliverTx, len(rawTxs[:50]))
+	responses := make([]*abci.ExecTxResult, len(rawTxs[:50]))
 	for i := 0; i < len(responses); i++ {
-		responses[i] = &abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+		responses[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
 	}
 
 	txmp.Lock()
-	require.NoError(t, txmp.Update(1, rawTxs[:50], responses, nil, nil))
+	require.NoError(t, txmp.Update(ctx, 1, rawTxs[:50], responses, nil, nil))
 	txmp.Unlock()
 
 	require.Equal(t, len(rawTxs)/2, txmp.Size())
@@ -206,8 +218,17 @@ func TestTxMempool_Size(t *testing.T) {
 }
 
 func TestTxMempool_Flush(t *testing.T) {
-	txmp := setup(t, 0)
-	txs := checkTxs(t, txmp, 100, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 0)
+	txs := checkTxs(ctx, t, txmp, 100, 0)
 	require.Equal(t, len(txs), txmp.Size())
 	require.Equal(t, int64(5690), txmp.SizeBytes())
 
@@ -216,13 +237,13 @@ func TestTxMempool_Flush(t *testing.T) {
 		rawTxs[i] = tx.tx
 	}
 
-	responses := make([]*abci.ResponseDeliverTx, len(rawTxs[:50]))
+	responses := make([]*abci.ExecTxResult, len(rawTxs[:50]))
 	for i := 0; i < len(responses); i++ {
-		responses[i] = &abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+		responses[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
 	}
 
 	txmp.Lock()
-	require.NoError(t, txmp.Update(1, rawTxs[:50], responses, nil, nil))
+	require.NoError(t, txmp.Update(ctx, 1, rawTxs[:50], responses, nil, nil))
 	txmp.Unlock()
 
 	txmp.Flush()
@@ -231,8 +252,17 @@ func TestTxMempool_Flush(t *testing.T) {
 }
 
 func TestTxMempool_ReapMaxBytesMaxGas(t *testing.T) {
-	txmp := setup(t, 0)
-	tTxs := checkTxs(t, txmp, 100, 0) // all txs request 1 gas unit
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 0)
+	tTxs := checkTxs(ctx, t, txmp, 100, 0) // all txs request 1 gas unit
 	require.Equal(t, len(tTxs), txmp.Size())
 	require.Equal(t, int64(5690), txmp.SizeBytes())
 
@@ -281,8 +311,17 @@ func TestTxMempool_ReapMaxBytesMaxGas(t *testing.T) {
 }
 
 func TestTxMempool_ReapMaxTxs(t *testing.T) {
-	txmp := setup(t, 0)
-	tTxs := checkTxs(t, txmp, 100, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 0)
+	tTxs := checkTxs(ctx, t, txmp, 100, 0)
 	require.Equal(t, len(tTxs), txmp.Size())
 	require.Equal(t, int64(5690), txmp.SizeBytes())
 
@@ -330,24 +369,41 @@ func TestTxMempool_ReapMaxTxs(t *testing.T) {
 }
 
 func TestTxMempool_CheckTxExceedsMaxSize(t *testing.T) {
-	txmp := setup(t, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+	txmp := setup(ctx, t, client, 0)
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	tx := make([]byte, txmp.config.MaxTxBytes+1)
 	_, err := rng.Read(tx)
 	require.NoError(t, err)
 
-	require.Error(t, txmp.CheckTx(context.Background(), tx, nil, TxInfo{SenderID: 0}))
+	require.Error(t, txmp.CheckTx(ctx, tx, nil, TxInfo{SenderID: 0}))
 
 	tx = make([]byte, txmp.config.MaxTxBytes-1)
 	_, err = rng.Read(tx)
 	require.NoError(t, err)
 
-	require.NoError(t, txmp.CheckTx(context.Background(), tx, nil, TxInfo{SenderID: 0}))
+	require.NoError(t, txmp.CheckTx(ctx, tx, nil, TxInfo{SenderID: 0}))
 }
 
 func TestTxMempool_CheckTxSamePeer(t *testing.T) {
-	txmp := setup(t, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 100)
 	peerID := uint16(1)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -357,12 +413,21 @@ func TestTxMempool_CheckTxSamePeer(t *testing.T) {
 
 	tx := []byte(fmt.Sprintf("sender-0=%X=%d", prefix, 50))
 
-	require.NoError(t, txmp.CheckTx(context.Background(), tx, nil, TxInfo{SenderID: peerID}))
-	require.Error(t, txmp.CheckTx(context.Background(), tx, nil, TxInfo{SenderID: peerID}))
+	require.NoError(t, txmp.CheckTx(ctx, tx, nil, TxInfo{SenderID: peerID}))
+	require.Error(t, txmp.CheckTx(ctx, tx, nil, TxInfo{SenderID: peerID}))
 }
 
 func TestTxMempool_CheckTxSameSender(t *testing.T) {
-	txmp := setup(t, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 100)
 	peerID := uint16(1)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -377,14 +442,23 @@ func TestTxMempool_CheckTxSameSender(t *testing.T) {
 	tx1 := []byte(fmt.Sprintf("sender-0=%X=%d", prefix1, 50))
 	tx2 := []byte(fmt.Sprintf("sender-0=%X=%d", prefix2, 50))
 
-	require.NoError(t, txmp.CheckTx(context.Background(), tx1, nil, TxInfo{SenderID: peerID}))
+	require.NoError(t, txmp.CheckTx(ctx, tx1, nil, TxInfo{SenderID: peerID}))
 	require.Equal(t, 1, txmp.Size())
-	require.NoError(t, txmp.CheckTx(context.Background(), tx2, nil, TxInfo{SenderID: peerID}))
+	require.NoError(t, txmp.CheckTx(ctx, tx2, nil, TxInfo{SenderID: peerID}))
 	require.Equal(t, 1, txmp.Size())
 }
 
 func TestTxMempool_ConcurrentTxs(t *testing.T) {
-	txmp := setup(t, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 100)
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	checkTxDone := make(chan struct{})
 
@@ -393,7 +467,7 @@ func TestTxMempool_ConcurrentTxs(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		for i := 0; i < 20; i++ {
-			_ = checkTxs(t, txmp, 100, 0)
+			_ = checkTxs(ctx, t, txmp, 100, 0)
 			dur := rng.Intn(1000-500) + 500
 			time.Sleep(time.Duration(dur) * time.Millisecond)
 		}
@@ -413,7 +487,7 @@ func TestTxMempool_ConcurrentTxs(t *testing.T) {
 		for range ticker.C {
 			reapedTxs := txmp.ReapMaxTxs(200)
 			if len(reapedTxs) > 0 {
-				responses := make([]*abci.ResponseDeliverTx, len(reapedTxs))
+				responses := make([]*abci.ExecTxResult, len(reapedTxs))
 				for i := 0; i < len(responses); i++ {
 					var code uint32
 
@@ -423,11 +497,11 @@ func TestTxMempool_ConcurrentTxs(t *testing.T) {
 						code = abci.CodeTypeOK
 					}
 
-					responses[i] = &abci.ResponseDeliverTx{Code: code}
+					responses[i] = &abci.ExecTxResult{Code: code}
 				}
 
 				txmp.Lock()
-				require.NoError(t, txmp.Update(height, reapedTxs, responses, nil, nil))
+				require.NoError(t, txmp.Update(ctx, height, reapedTxs, responses, nil, nil))
 				txmp.Unlock()
 
 				height++
@@ -448,30 +522,39 @@ func TestTxMempool_ConcurrentTxs(t *testing.T) {
 }
 
 func TestTxMempool_ExpiredTxs_NumBlocks(t *testing.T) {
-	txmp := setup(t, 500)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+	if err := client.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Wait)
+
+	txmp := setup(ctx, t, client, 500)
 	txmp.height = 100
 	txmp.config.TTLNumBlocks = 10
 
-	tTxs := checkTxs(t, txmp, 100, 0)
+	tTxs := checkTxs(ctx, t, txmp, 100, 0)
 	require.Equal(t, len(tTxs), txmp.Size())
 	require.Equal(t, 100, txmp.heightIndex.Size())
 
 	// reap 5 txs at the next height -- no txs should expire
 	reapedTxs := txmp.ReapMaxTxs(5)
-	responses := make([]*abci.ResponseDeliverTx, len(reapedTxs))
+	responses := make([]*abci.ExecTxResult, len(reapedTxs))
 	for i := 0; i < len(responses); i++ {
-		responses[i] = &abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+		responses[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
 	}
 
 	txmp.Lock()
-	require.NoError(t, txmp.Update(txmp.height+1, reapedTxs, responses, nil, nil))
+	require.NoError(t, txmp.Update(ctx, txmp.height+1, reapedTxs, responses, nil, nil))
 	txmp.Unlock()
 
 	require.Equal(t, 95, txmp.Size())
 	require.Equal(t, 95, txmp.heightIndex.Size())
 
 	// check more txs at height 101
-	_ = checkTxs(t, txmp, 50, 1)
+	_ = checkTxs(ctx, t, txmp, 50, 1)
 	require.Equal(t, 145, txmp.Size())
 	require.Equal(t, 145, txmp.heightIndex.Size())
 
@@ -484,13 +567,13 @@ func TestTxMempool_ExpiredTxs_NumBlocks(t *testing.T) {
 	// removed. However, we do know that that at most 95 txs can be expired and
 	// removed.
 	reapedTxs = txmp.ReapMaxTxs(5)
-	responses = make([]*abci.ResponseDeliverTx, len(reapedTxs))
+	responses = make([]*abci.ExecTxResult, len(reapedTxs))
 	for i := 0; i < len(responses); i++ {
-		responses[i] = &abci.ResponseDeliverTx{Code: abci.CodeTypeOK}
+		responses[i] = &abci.ExecTxResult{Code: abci.CodeTypeOK}
 	}
 
 	txmp.Lock()
-	require.NoError(t, txmp.Update(txmp.height+10, reapedTxs, responses, nil, nil))
+	require.NoError(t, txmp.Update(ctx, txmp.height+10, reapedTxs, responses, nil, nil))
 	txmp.Unlock()
 
 	require.GreaterOrEqual(t, txmp.Size(), 45)
@@ -498,6 +581,9 @@ func TestTxMempool_ExpiredTxs_NumBlocks(t *testing.T) {
 }
 
 func TestTxMempool_CheckTxPostCheckError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	cases := []struct {
 		name string
 		err  error
@@ -514,25 +600,32 @@ func TestTxMempool_CheckTxPostCheckError(t *testing.T) {
 	for _, tc := range cases {
 		testCase := tc
 		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+
+			client := abciclient.NewLocalClient(log.NewNopLogger(), &application{Application: kvstore.NewApplication()})
+			if err := client.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(client.Wait)
+
 			postCheckFn := func(_ types.Tx, _ *abci.ResponseCheckTx) error {
 				return testCase.err
 			}
-			txmp := setup(t, 0, WithPostCheck(postCheckFn))
+			txmp := setup(ctx, t, client, 0, WithPostCheck(postCheckFn))
 			rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 			tx := make([]byte, txmp.config.MaxTxBytes-1)
 			_, err := rng.Read(tx)
 			require.NoError(t, err)
 
-			callback := func(res *abci.Response) {
-				checkTxRes, ok := res.Value.(*abci.Response_CheckTx)
-				require.True(t, ok)
+			callback := func(res *abci.ResponseCheckTx) {
 				expectedErrString := ""
 				if testCase.err != nil {
 					expectedErrString = testCase.err.Error()
 				}
-				require.Equal(t, expectedErrString, checkTxRes.CheckTx.MempoolError)
+				require.Equal(t, expectedErrString, res.MempoolError)
 			}
-			require.NoError(t, txmp.CheckTx(context.Background(), tx, callback, TxInfo{SenderID: 0}))
+			require.NoError(t, txmp.CheckTx(ctx, tx, callback, TxInfo{SenderID: 0}))
 		})
 	}
 }
