@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"sync"
 	"testing"
@@ -31,6 +32,7 @@ import (
 	"github.com/tendermint/tendermint/internal/test/factory"
 	"github.com/tendermint/tendermint/libs/log"
 	tmcons "github.com/tendermint/tendermint/proto/tendermint/consensus"
+	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 	"github.com/tendermint/tendermint/types"
 )
 
@@ -44,10 +46,10 @@ type reactorTestSuite struct {
 	reactors            map[types.NodeID]*Reactor
 	subs                map[types.NodeID]eventbus.Subscription
 	blocksyncSubs       map[types.NodeID]eventbus.Subscription
-	stateChannels       map[types.NodeID]*p2p.Channel
-	dataChannels        map[types.NodeID]*p2p.Channel
-	voteChannels        map[types.NodeID]*p2p.Channel
-	voteSetBitsChannels map[types.NodeID]*p2p.Channel
+	stateChannels       map[types.NodeID]p2p.Channel
+	dataChannels        map[types.NodeID]p2p.Channel
+	voteChannels        map[types.NodeID]p2p.Channel
+	voteSetBitsChannels map[types.NodeID]p2p.Channel
 }
 
 func chDesc(chID p2p.ChannelID, size int) *p2p.ChannelDescriptor {
@@ -84,7 +86,7 @@ func setup(
 	t.Cleanup(cancel)
 
 	chCreator := func(nodeID types.NodeID) p2p.ChannelCreator {
-		return func(ctx context.Context, desc *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+		return func(ctx context.Context, desc *p2p.ChannelDescriptor) (p2p.Channel, error) {
 			switch desc.ID {
 			case StateChannel:
 				return rts.stateChannels[nodeID], nil
@@ -104,16 +106,15 @@ func setup(
 	for nodeID, node := range rts.network.Nodes {
 		state := states[i]
 
-		reactor, err := NewReactor(ctx,
+		reactor := NewReactor(
 			state.logger.With("node", nodeID),
 			state,
 			chCreator(nodeID),
-			node.MakePeerUpdates(ctx, t),
+			func(ctx context.Context) *p2p.PeerUpdates { return node.MakePeerUpdates(ctx, t) },
 			state.eventBus,
 			true,
 			NopMetrics(),
 		)
-		require.NoError(t, err)
 
 		blocksSub, err := state.eventBus.SubscribeWithArgs(ctx, tmpubsub.SubscribeArgs{
 			ClientID: testSubscriber,
@@ -450,7 +451,7 @@ func TestReactorWithEvidence(t *testing.T) {
 	tickerFunc := newMockTickerFunc(true)
 
 	valSet, privVals := factory.ValidatorSet(ctx, t, n, 30)
-	genDoc := factory.GenesisDoc(cfg, time.Now(), valSet.Validators, nil)
+	genDoc := factory.GenesisDoc(cfg, time.Now(), valSet.Validators, factory.ConsensusParams())
 	states := make([]*State, n)
 	logger := consensusLogger()
 
@@ -467,7 +468,8 @@ func TestReactorWithEvidence(t *testing.T) {
 
 		app := kvstore.NewApplication()
 		vals := types.TM2PB.ValidatorUpdates(state.Validators)
-		app.InitChain(abci.RequestInitChain{Validators: vals})
+		_, err = app.InitChain(ctx, &abci.RequestInitChain{Validators: vals})
+		require.NoError(t, err)
 
 		pv := privVals[i]
 		blockDB := dbm.NewMemDB()
@@ -504,9 +506,9 @@ func TestReactorWithEvidence(t *testing.T) {
 		eventBus := eventbus.NewDefault(log.NewNopLogger().With("module", "events"))
 		require.NoError(t, eventBus.Start(ctx))
 
-		blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus)
+		blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus, sm.NopMetrics())
 
-		cs, err := NewState(ctx, logger.With("validator", i, "module", "consensus"),
+		cs, err := NewState(logger.With("validator", i, "module", "consensus"),
 			thisConfig.Consensus, stateStore, blockExec, blockStore, mempool, evpool2, eventBus)
 		require.NoError(t, err)
 		cs.SetPrivValidator(ctx, pv)
@@ -599,6 +601,118 @@ func TestReactorCreatesBlockWhenEmptyBlocksFalse(t *testing.T) {
 	wg.Wait()
 }
 
+// TestSwitchToConsensusVoteExtensions tests that the SwitchToConsensus correctly
+// checks for vote extension data when required.
+func TestSwitchToConsensusVoteExtensions(t *testing.T) {
+	for _, testCase := range []struct {
+		name                  string
+		storedHeight          int64
+		initialRequiredHeight int64
+		includeExtensions     bool
+		shouldPanic           bool
+	}{
+		{
+			name:                  "no vote extensions but not required",
+			initialRequiredHeight: 0,
+			storedHeight:          2,
+			includeExtensions:     false,
+			shouldPanic:           false,
+		},
+		{
+			name:                  "no vote extensions but required this height",
+			initialRequiredHeight: 2,
+			storedHeight:          2,
+			includeExtensions:     false,
+			shouldPanic:           true,
+		},
+		{
+			name:                  "no vote extensions and required in future",
+			initialRequiredHeight: 3,
+			storedHeight:          2,
+			includeExtensions:     false,
+			shouldPanic:           false,
+		},
+		{
+			name:                  "no vote extensions and required previous height",
+			initialRequiredHeight: 1,
+			storedHeight:          2,
+			includeExtensions:     false,
+			shouldPanic:           true,
+		},
+		{
+			name:                  "vote extensions and required previous height",
+			initialRequiredHeight: 1,
+			storedHeight:          2,
+			includeExtensions:     true,
+			shouldPanic:           false,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
+			defer cancel()
+			cs, vs := makeState(ctx, t, makeStateArgs{validators: 1})
+			validator := vs[0]
+			validator.Height = testCase.storedHeight
+
+			cs.state.LastBlockHeight = testCase.storedHeight
+			cs.state.LastValidators = cs.state.Validators.Copy()
+			cs.state.ConsensusParams.ABCI.VoteExtensionsEnableHeight = testCase.initialRequiredHeight
+
+			propBlock, err := cs.createProposalBlock(ctx)
+			require.NoError(t, err)
+
+			// Consensus is preparing to do the next height after the stored height.
+			cs.Height = testCase.storedHeight + 1
+			propBlock.Height = testCase.storedHeight
+			blockParts, err := propBlock.MakePartSet(types.BlockPartSizeBytes)
+			require.NoError(t, err)
+
+			var voteSet *types.VoteSet
+			if testCase.includeExtensions {
+				voteSet = types.NewExtendedVoteSet(cs.state.ChainID, testCase.storedHeight, 0, tmproto.PrecommitType, cs.state.Validators)
+			} else {
+				voteSet = types.NewVoteSet(cs.state.ChainID, testCase.storedHeight, 0, tmproto.PrecommitType, cs.state.Validators)
+			}
+			signedVote := signVote(ctx, t, validator, tmproto.PrecommitType, cs.state.ChainID, types.BlockID{
+				Hash:          propBlock.Hash(),
+				PartSetHeader: blockParts.Header(),
+			})
+
+			if !testCase.includeExtensions {
+				signedVote.Extension = nil
+				signedVote.ExtensionSignature = nil
+			}
+
+			added, err := voteSet.AddVote(signedVote)
+			require.NoError(t, err)
+			require.True(t, added)
+
+			if testCase.includeExtensions {
+				cs.blockStore.SaveBlockWithExtendedCommit(propBlock, blockParts, voteSet.MakeExtendedCommit())
+			} else {
+				cs.blockStore.SaveBlock(propBlock, blockParts, voteSet.MakeExtendedCommit().ToCommit())
+			}
+			reactor := NewReactor(
+				log.NewNopLogger(),
+				cs,
+				nil,
+				nil,
+				cs.eventBus,
+				true,
+				NopMetrics(),
+			)
+
+			if testCase.shouldPanic {
+				assert.Panics(t, func() {
+					reactor.SwitchToConsensus(ctx, cs.state, false)
+				})
+			} else {
+				reactor.SwitchToConsensus(ctx, cs.state, false)
+			}
+		})
+	}
+}
+
 func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -665,6 +779,10 @@ func TestReactorRecordsVotesAndBlockParts(t *testing.T) {
 }
 
 func TestReactorVotingPowerChange(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
@@ -771,13 +889,17 @@ func TestReactorVotingPowerChange(t *testing.T) {
 }
 
 func TestReactorValidatorSetChanges(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	cfg := configSetup(t)
 
-	nPeers := 7
-	nVals := 4
+	nPeers := 4
+	nVals := 2
 	states, _, _, cleanup := randConsensusNetWithPeers(
 		ctx,
 		t,
@@ -870,60 +992,27 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	// it includes the commit for block 4, which should have the updated validator set
 	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 
-	updateValidatorPubKey1, err := states[nVals].privValidator.GetPubKey(ctx)
-	require.NoError(t, err)
+	for i := 2; i <= 32; i *= 2 {
+		useState := rand.Intn(nVals)
+		t.Log(useState)
+		updateValidatorPubKey1, err := states[useState].privValidator.GetPubKey(ctx)
+		require.NoError(t, err)
 
-	updatePubKey1ABCI, err := encoding.PubKeyToProto(updateValidatorPubKey1)
-	require.NoError(t, err)
+		updatePubKey1ABCI, err := encoding.PubKeyToProto(updateValidatorPubKey1)
+		require.NoError(t, err)
 
-	updateValidatorTx1 := kvstore.MakeValSetChangeTx(updatePubKey1ABCI, 25)
-	previousTotalVotingPower := states[nVals].GetRoundState().LastValidators.TotalVotingPower()
+		previousTotalVotingPower := states[useState].GetRoundState().LastValidators.TotalVotingPower()
+		updateValidatorTx1 := kvstore.MakeValSetChangeTx(updatePubKey1ABCI, int64(i))
 
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
-	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
-	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
+		waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
+		waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, updateValidatorTx1)
+		waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
+		waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
 
-	require.NotEqualf(
-		t, states[nVals].GetRoundState().LastValidators.TotalVotingPower(), previousTotalVotingPower,
-		"expected voting power to change (before: %d, after: %d)",
-		previousTotalVotingPower, states[nVals].GetRoundState().LastValidators.TotalVotingPower(),
-	)
-
-	newValidatorPubKey2, err := states[nVals+1].privValidator.GetPubKey(ctx)
-	require.NoError(t, err)
-
-	newVal2ABCI, err := encoding.PubKeyToProto(newValidatorPubKey2)
-	require.NoError(t, err)
-
-	newValidatorTx2 := kvstore.MakeValSetChangeTx(newVal2ABCI, testMinPower)
-
-	newValidatorPubKey3, err := states[nVals+2].privValidator.GetPubKey(ctx)
-	require.NoError(t, err)
-
-	newVal3ABCI, err := encoding.PubKeyToProto(newValidatorPubKey3)
-	require.NoError(t, err)
-
-	newValidatorTx3 := kvstore.MakeValSetChangeTx(newVal3ABCI, testMinPower)
-
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
-	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, newValidatorTx2, newValidatorTx3)
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
-
-	activeVals[string(newValidatorPubKey2.Address())] = struct{}{}
-	activeVals[string(newValidatorPubKey3.Address())] = struct{}{}
-
-	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
-
-	removeValidatorTx2 := kvstore.MakeValSetChangeTx(newVal2ABCI, 0)
-	removeValidatorTx3 := kvstore.MakeValSetChangeTx(newVal3ABCI, 0)
-
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
-	waitForAndValidateBlockWithTx(ctx, t, nPeers, activeVals, blocksSubs, states, removeValidatorTx2, removeValidatorTx3)
-	waitForAndValidateBlock(ctx, t, nPeers, activeVals, blocksSubs, states)
-
-	delete(activeVals, string(newValidatorPubKey2.Address()))
-	delete(activeVals, string(newValidatorPubKey3.Address()))
-
-	waitForBlockWithUpdatedValsAndValidateIt(ctx, t, nPeers, activeVals, blocksSubs, states)
+		require.NotEqualf(
+			t, states[useState].GetRoundState().LastValidators.TotalVotingPower(), previousTotalVotingPower,
+			"expected voting power to change (before: %d, after: %d)",
+			previousTotalVotingPower, states[useState].GetRoundState().LastValidators.TotalVotingPower(),
+		)
+	}
 }

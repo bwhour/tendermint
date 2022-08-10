@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/tendermint/tendermint/crypto"
 	"github.com/tendermint/tendermint/types"
@@ -24,7 +25,7 @@ type Protocol string
 // Transport is a connection-oriented mechanism for exchanging data with a peer.
 type Transport interface {
 	// Listen starts the transport on the specified endpoint.
-	Listen(Endpoint) error
+	Listen(*Endpoint) error
 
 	// Protocols returns the protocols supported by the transport. The Router
 	// uses this to pick a transport for an Endpoint.
@@ -34,7 +35,7 @@ type Transport interface {
 	//
 	// How to listen is transport-dependent, e.g. MConnTransport uses Listen() while
 	// MemoryTransport starts listening via MemoryNetwork.CreateTransport().
-	Endpoints() []Endpoint
+	Endpoint() (*Endpoint, error)
 
 	// Accept waits for the next inbound connection on a listening endpoint, blocking
 	// until either a connection is available or the transport is closed. On closure,
@@ -42,7 +43,7 @@ type Transport interface {
 	Accept(context.Context) (Connection, error)
 
 	// Dial creates an outbound connection to an endpoint.
-	Dial(context.Context, Endpoint) (Connection, error)
+	Dial(context.Context, *Endpoint) (Connection, error)
 
 	// Close stops accepting new connections, but does not close active connections.
 	Close() error
@@ -81,7 +82,7 @@ type Connection interface {
 	// FIXME: The handshake should really be the Router's responsibility, but
 	// that requires the connection interface to be byte-oriented rather than
 	// message-oriented (see comment above).
-	Handshake(context.Context, types.NodeInfo, crypto.PrivKey) (types.NodeInfo, crypto.PubKey, error)
+	Handshake(context.Context, time.Duration, types.NodeInfo, crypto.PrivKey) (types.NodeInfo, crypto.PubKey, error)
 
 	// ReceiveMessage returns the next message received on the connection,
 	// blocking until one is available. Returns io.EOF if closed.
@@ -129,13 +130,13 @@ type Endpoint struct {
 }
 
 // NewEndpoint constructs an Endpoint from a types.NetAddress structure.
-func NewEndpoint(addr string) (Endpoint, error) {
+func NewEndpoint(addr string) (*Endpoint, error) {
 	ip, port, err := types.ParseAddressString(addr)
 	if err != nil {
-		return Endpoint{}, err
+		return nil, err
 	}
 
-	return Endpoint{
+	return &Endpoint{
 		Protocol: MConnProtocol,
 		IP:       ip,
 		Port:     port,

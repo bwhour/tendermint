@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"gotest.tools/assert"
+
 	abciclient "github.com/tendermint/tendermint/abci/client"
 	abcimocks "github.com/tendermint/tendermint/abci/client/mocks"
 	"github.com/tendermint/tendermint/abci/example/kvstore"
@@ -21,7 +23,6 @@ import (
 	"github.com/tendermint/tendermint/abci/types"
 	"github.com/tendermint/tendermint/libs/log"
 	tmrand "github.com/tendermint/tendermint/libs/rand"
-	"gotest.tools/assert"
 )
 
 //----------------------------------------
@@ -29,7 +30,7 @@ import (
 type appConnTestI interface {
 	Echo(context.Context, string) (*types.ResponseEcho, error)
 	Flush(context.Context) error
-	Info(context.Context, types.RequestInfo) (*types.ResponseInfo, error)
+	Info(context.Context, *types.RequestInfo) (*types.ResponseInfo, error)
 }
 
 type appConnTest struct {
@@ -48,7 +49,7 @@ func (app *appConnTest) Flush(ctx context.Context) error {
 	return app.appConn.Flush(ctx)
 }
 
-func (app *appConnTest) Info(ctx context.Context, req types.RequestInfo) (*types.ResponseInfo, error) {
+func (app *appConnTest) Info(ctx context.Context, req *types.RequestInfo) (*types.ResponseInfo, error) {
 	return app.appConn.Info(ctx, req)
 }
 
@@ -57,7 +58,7 @@ func (app *appConnTest) Info(ctx context.Context, req types.RequestInfo) (*types
 var SOCKET = "socket"
 
 func TestEcho(t *testing.T) {
-	sockPath := fmt.Sprintf("unix:///tmp/echo_%v.sock", tmrand.Str(6))
+	sockPath := fmt.Sprintf("unix://%s/echo_%v.sock", t.TempDir(), tmrand.Str(6))
 	logger := log.NewNopLogger()
 	client, err := abciclient.NewClient(logger, sockPath, SOCKET, true)
 	if err != nil {
@@ -97,7 +98,7 @@ func TestEcho(t *testing.T) {
 
 func BenchmarkEcho(b *testing.B) {
 	b.StopTimer() // Initialize
-	sockPath := fmt.Sprintf("unix:///tmp/echo_%v.sock", tmrand.Str(6))
+	sockPath := fmt.Sprintf("unix://%s/echo_%v.sock", b.TempDir(), tmrand.Str(6))
 	logger := log.NewNopLogger()
 	client, err := abciclient.NewClient(logger, sockPath, SOCKET, true)
 	if err != nil {
@@ -145,7 +146,7 @@ func TestInfo(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sockPath := fmt.Sprintf("unix:///tmp/echo_%v.sock", tmrand.Str(6))
+	sockPath := fmt.Sprintf("unix://%s/echo_%v.sock", t.TempDir(), tmrand.Str(6))
 	logger := log.NewNopLogger()
 	client, err := abciclient.NewClient(logger, sockPath, SOCKET, true)
 	if err != nil {
@@ -163,7 +164,7 @@ func TestInfo(t *testing.T) {
 	proxy := newAppConnTest(client)
 	t.Log("Connected")
 
-	resInfo, err := proxy.Info(ctx, RequestInfo)
+	resInfo, err := proxy.Info(ctx, &RequestInfo)
 	require.NoError(t, err)
 
 	if resInfo.Data != "{\"size\":0}" {

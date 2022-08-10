@@ -33,6 +33,10 @@ import (
 // Byzantine node sends two different prevotes (nil and blockID) to the same
 // validator.
 func TestByzantinePrevoteEquivocation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	// empirically, this test either passes in <1s or hits some
 	// kind of deadlock and hit the larger timeout. This timeout
 	// can be extended a bunch if needed, but it's good to avoid
@@ -48,7 +52,7 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 	tickerFunc := newMockTickerFunc(true)
 
 	valSet, privVals := factory.ValidatorSet(ctx, t, nValidators, 30)
-	genDoc := factory.GenesisDoc(config, time.Now(), valSet.Validators, nil)
+	genDoc := factory.GenesisDoc(config, time.Now(), valSet.Validators, factory.ConsensusParams())
 	states := make([]*State, nValidators)
 
 	for i := 0; i < nValidators; i++ {
@@ -68,7 +72,8 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 			ensureDir(t, path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
 			app := kvstore.NewApplication()
 			vals := types.TM2PB.ValidatorUpdates(state.Validators)
-			app.InitChain(abci.RequestInitChain{Validators: vals})
+			_, err = app.InitChain(ctx, &abci.RequestInitChain{Validators: vals})
+			require.NoError(t, err)
 
 			blockDB := dbm.NewMemDB()
 			blockStore := store.NewBlockStore(blockDB)
@@ -95,8 +100,8 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 			evpool := evidence.NewPool(logger.With("module", "evidence"), evidenceDB, stateStore, blockStore, evidence.NopMetrics(), eventBus)
 
 			// Make State
-			blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus)
-			cs, err := NewState(ctx, logger, thisConfig.Consensus, stateStore, blockExec, blockStore, mempool, evpool, eventBus)
+			blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), proxyAppConnCon, mempool, evpool, blockStore, eventBus, sm.NopMetrics())
+			cs, err := NewState(logger, thisConfig.Consensus, stateStore, blockExec, blockStore, mempool, evpool, eventBus)
 			require.NoError(t, err)
 			// set private validator
 			pv := privVals[i]
@@ -141,8 +146,10 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 			// send two votes to all peers (1st to one half, 2nd to another half)
 			i := 0
 			for _, ps := range bzReactor.peers {
+				voteCh := rts.voteChannels[bzNodeID]
 				if i < len(bzReactor.peers)/2 {
-					require.NoError(t, bzReactor.voteCh.Send(ctx,
+
+					require.NoError(t, voteCh.Send(ctx,
 						p2p.Envelope{
 							To: ps.peerID,
 							Message: &tmcons.Vote{
@@ -150,7 +157,7 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 							},
 						}))
 				} else {
-					require.NoError(t, bzReactor.voteCh.Send(ctx,
+					require.NoError(t, voteCh.Send(ctx,
 						p2p.Envelope{
 							To: ps.peerID,
 							Message: &tmcons.Vote{
@@ -175,22 +182,22 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 	lazyNodeState.decideProposal = func(ctx context.Context, height int64, round int32) {
 		require.NotNil(t, lazyNodeState.privValidator)
 
-		var commit *types.Commit
+		var extCommit *types.ExtendedCommit
 		switch {
 		case lazyNodeState.Height == lazyNodeState.state.InitialHeight:
 			// We're creating a proposal for the first block.
 			// The commit is empty, but not nil.
-			commit = types.NewCommit(0, 0, types.BlockID{}, nil)
+			extCommit = &types.ExtendedCommit{}
 		case lazyNodeState.LastCommit.HasTwoThirdsMajority():
 			// Make the commit from LastCommit
-			commit = lazyNodeState.LastCommit.MakeCommit()
+			extCommit = lazyNodeState.LastCommit.MakeExtendedCommit()
 		default: // This shouldn't happen.
 			lazyNodeState.logger.Error("enterPropose: Cannot propose anything: No commit for the previous block")
 			return
 		}
 
 		// omit the last signature in the commit
-		commit.Signatures[len(commit.Signatures)-1] = types.NewCommitSigAbsent()
+		extCommit.ExtendedSignatures[len(extCommit.ExtendedSignatures)-1] = types.NewExtendedCommitSigAbsent()
 
 		if lazyNodeState.privValidatorPubKey == nil {
 			// If this node is a validator & proposer in the current round, it will
@@ -201,7 +208,7 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 		proposerAddr := lazyNodeState.privValidatorPubKey.Address()
 
 		block, err := lazyNodeState.blockExec.CreateProposalBlock(
-			ctx, lazyNodeState.Height, lazyNodeState.state, commit, proposerAddr, nil)
+			ctx, lazyNodeState.Height, lazyNodeState.state, extCommit, proposerAddr)
 		require.NoError(t, err)
 		blockParts, err := block.MakePartSet(types.BlockPartSizeBytes)
 		require.NoError(t, err)

@@ -48,7 +48,7 @@ func createMConnectionWithCallbacks(
 }
 
 func TestMConnectionSendFlushStop(t *testing.T) {
-	server, client := NetPipe()
+	server, client := net.Pipe()
 	t.Cleanup(closeAll(t, client, server))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -85,7 +85,7 @@ func TestMConnectionSendFlushStop(t *testing.T) {
 }
 
 func TestMConnectionSend(t *testing.T) {
-	server, client := NetPipe()
+	server, client := net.Pipe()
 	t.Cleanup(closeAll(t, client, server))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -116,7 +116,7 @@ func TestMConnectionSend(t *testing.T) {
 }
 
 func TestMConnectionReceive(t *testing.T) {
-	server, client := NetPipe()
+	server, client := net.Pipe()
 	t.Cleanup(closeAll(t, client, server))
 
 	receivedCh := make(chan []byte)
@@ -315,6 +315,10 @@ func TestMConnectionMultiplePings(t *testing.T) {
 }
 
 func TestMConnectionPingPongs(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	// check that we are not leaking any go-routines
 	t.Cleanup(leaktest.CheckTimeout(t, 10*time.Second))
 
@@ -378,7 +382,7 @@ func TestMConnectionPingPongs(t *testing.T) {
 }
 
 func TestMConnectionStopsAndReturnsError(t *testing.T) {
-	server, client := NetPipe()
+	server, client := net.Pipe()
 	t.Cleanup(closeAll(t, client, server))
 
 	receivedCh := make(chan []byte)
@@ -423,7 +427,7 @@ func newClientAndServerConnsForReadErrors(
 	t *testing.T,
 	chOnErr chan struct{},
 ) (*MConnection, *MConnection) {
-	server, client := NetPipe()
+	server, client := net.Pipe()
 
 	onReceive := func(context.Context, ChannelID, []byte) {}
 	onError := func(context.Context, interface{}) {}
@@ -558,7 +562,11 @@ func TestMConnectionReadErrorUnknownMsgType(t *testing.T) {
 }
 
 func TestMConnectionTrySend(t *testing.T) {
-	server, client := NetPipe()
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
+	server, client := net.Pipe()
 	t.Cleanup(closeAll(t, client, server))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -606,6 +614,10 @@ func TestConnVectors(t *testing.T) {
 }
 
 func TestMConnectionChannelOverflow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
+
 	chOnErr := make(chan struct{})
 	chOnRcv := make(chan struct{})
 

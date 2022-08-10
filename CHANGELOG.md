@@ -2,6 +2,133 @@
 
 Friendly reminder: We have a [bug bounty program](https://hackerone.com/cosmos).
 
+## v0.35.9
+
+July 20, 2022
+
+This release fixes a deadlock that could occur in some cases when using the
+priority mempool with the ABCI socket client.
+
+### BUG FIXES
+
+- [mempool] [\#9030](https://github.com/tendermint/tendermint/pull/9030) rework lock discipline to mitigate callback deadlocks (@creachadair)
+
+
+## v0.35.8
+
+July 12, 2022
+
+Special thanks to external contributors on this release: @joeabbey
+
+This release fixes an unbounded heap growth issue in the implementation of the
+priority mempool, as well as some configuration, logging, and peer dialing
+improvements in the non-legacy p2p stack. It also adds a new opt-in
+"simple-priority" value for the `p2p.queue-type` setting, that should improve
+gossip performance for non-legacy peer networks.
+
+### BREAKING CHANGES
+
+- CLI/RPC/Config
+
+   - [node] [\#8902](https://github.com/tendermint/tendermint/pull/8902) Always start blocksync and avoid misconfiguration (@tychoish)
+
+### FEATURES
+
+- [cli] [\#8675](https://github.com/tendermint/tendermint/pull/8675) Add command to force compact goleveldb databases (@cmwaters)
+
+### IMPROVEMENTS
+
+- [p2p] [\#8914](https://github.com/tendermint/tendermint/pull/8914) [\#8875](https://github.com/tendermint/tendermint/pull/8875) Improvements to peer dialing (backported). (@tychoish)
+- [p2p] [\#8820](https://github.com/tendermint/tendermint/pull/8820) add eviction metrics and cleanup dialing error handling (backport #8819) (@tychoish)
+- [logging] [\#8896](https://github.com/tendermint/tendermint/pull/8896) Do not pre-process log results (backport #8895). (@tychoish)
+- [p2p] [\#8956](https://github.com/tendermint/tendermint/pull/8956) Simpler priority queue (backport #8929). (@tychoish)
+
+### BUG FIXES
+
+- [mempool] [\#8944](https://github.com/tendermint/tendermint/pull/8944) Fix unbounded heap growth in the priority mempool. (@creachadair)
+- [p2p] [\#8869](https://github.com/tendermint/tendermint/pull/8869) Set empty timeouts to configed values. (backport #8847). (@williambanfield)
+
+
+## v0.35.7
+
+June 16, 2022
+
+### BUG FIXES
+
+- [p2p] [\#8692](https://github.com/tendermint/tendermint/pull/8692) scale the number of stored peers by the configured maximum connections (#8684)
+- [rpc] [\#8715](https://github.com/tendermint/tendermint/pull/8715) always close http bodies (backport #8712)
+- [p2p] [\#8760](https://github.com/tendermint/tendermint/pull/8760) accept should not abort on first error (backport #8759)
+
+### BREAKING CHANGES
+
+- P2P Protocol
+
+  - [p2p] [\#8737](https://github.com/tendermint/tendermint/pull/8737) Introduce "inactive" peer label to avoid re-dialing incompatible peers. (@tychoish)
+  - [p2p] [\#8737](https://github.com/tendermint/tendermint/pull/8737) Increase frequency of dialing attempts to reduce latency for peer acquisition. (@tychoish)
+  - [p2p] [\#8737](https://github.com/tendermint/tendermint/pull/8737) Improvements to peer scoring and sorting to gossip a greater variety of peers during PEX. (@tychoish)
+  - [p2p] [\#8737](https://github.com/tendermint/tendermint/pull/8737) Track incoming and outgoing peers separately to ensure more peer slots open for incoming connections. (@tychoish)
+
+## v0.35.6
+
+June 3, 2022
+
+### FEATURES
+
+- [migrate] [\#8672](https://github.com/tendermint/tendermint/pull/8672) provide function for database production (backport #8614) (@tychoish)
+
+### BUG FIXES
+
+- [consensus] [\#8651](https://github.com/tendermint/tendermint/pull/8651) restructure peer catchup sleep (@tychoish)
+- [pex] [\#8657](https://github.com/tendermint/tendermint/pull/8657) align max address thresholds (@cmwaters)
+- [cmd] [\#8668](https://github.com/tendermint/tendermint/pull/8668) don't used global config for reset commands (@cmwaters)
+- [p2p] [\#8681](https://github.com/tendermint/tendermint/pull/8681) shed peers from store from other networks (backport #8678) (@tychoish)
+
+
+## v0.35.5
+
+May 26, 2022
+
+### BUG FIXES
+
+- [p2p] [\#8371](https://github.com/tendermint/tendermint/pull/8371) fix setting in con-tracker (backport #8370) (@tychoish)
+- [blocksync] [\#8496](https://github.com/tendermint/tendermint/pull/8496) validate block against state before persisting it to disk (@cmwaters)
+- [statesync] [\#8494](https://github.com/tendermint/tendermint/pull/8494) avoid potential race (@tychoish)
+- [keymigrate] [\#8467](https://github.com/tendermint/tendermint/pull/8467) improve filtering for legacy transaction hashes (backport #8466) (@creachadair)
+- [rpc] [\#8594](https://github.com/tendermint/tendermint/pull/8594) fix encoding of block_results responses (@creachadair)
+
+## v0.35.4
+
+April 18, 2022
+
+Special thanks to external contributors on this release: @firelizzard18
+
+### FEATURES
+
+- [cli] [\#8300](https://github.com/tendermint/tendermint/pull/8300) Add a tool to update old config files to the latest version [backport [\#8281](https://github.com/tendermint/tendermint/pull/8281)]. (@creachadair)
+
+### IMPROVEMENTS
+
+### BUG FIXES
+
+- [cli] [\#8294](https://github.com/tendermint/tendermint/pull/8294) keymigrate: ensure block hash keys are correctly translated. (@creachadair)
+- [cli] [\#8352](https://github.com/tendermint/tendermint/pull/8352) keymigrate: ensure transaction hash keys are correctly translated. (@creachadair)
+
+## v0.35.3
+
+April 8, 2022
+
+### FEATURES
+
+- [cli] [\#8081](https://github.com/tendermint/tendermint/pull/8081) add a safer-to-use `reset-state` command. (@marbar3778)
+
+### IMPROVEMENTS
+
+- [consensus] [\#8138](https://github.com/tendermint/tendermint/pull/8138) change lock handling in reactor and handleMsg for RoundState. (@williambanfield)
+
+### BUG FIXES
+
+- [cli] [\#8276](https://github.com/tendermint/tendermint/pull/8276) scmigrate: ensure target key is correctly renamed. (@creachadair)
+
 ## v0.35.2
 
 February 28, 2022
@@ -94,7 +221,7 @@ Special thanks to external contributors on this release: @JayT106,
 
 - [\#7106](https://github.com/tendermint/tendermint/pull/7106) Revert mutex change to ABCI Clients (@tychoish).
 - [\#7142](https://github.com/tendermint/tendermint/pull/7142) mempool: remove panic when recheck-tx was not sent to ABCI application (@williambanfield).
-- [consensus]: [\#7060](https://github.com/tendermint/tendermint/pull/7060)
+- [consensus]: [\#7060](https://github.com/tendermint/tendermint/pull/7060) <!-- markdown-link-check-disable-line -->
   wait until peerUpdates channel is closed to close remaining peers (@williambanfield)
 - [privval] [\#5638](https://github.com/tendermint/tendermint/pull/5638) Increase read/write timeout to 5s and calculate ping interval based on it (@JoeKash)
 - [evidence] [\#6375](https://github.com/tendermint/tendermint/pull/6375) Fix bug with inconsistent LightClientAttackEvidence hashing (cmwaters)
@@ -229,6 +356,32 @@ Special thanks to external contributors on this release: @JayT106,
 - [rpc] [\#6615](https://github.com/tendermint/tendermint/pull/6615) Add TotalGasUsed to block_results response (@crypto-facs)
 - [cmd/tendermint/commands] [\#6623](https://github.com/tendermint/tendermint/pull/6623) replace `$HOME/.some/test/dir` with `t.TempDir` (@tanyabouman)
 - [statesync] \6807 Implement P2P state provider as an alternative to RPC (@cmwaters)
+
+## v0.34.19
+
+### BUG FIXES
+
+- [cli] [\#8270](https://github.com/tendermint/tendermint/issues/8270) fix reset commands (@alexanderbez).
+
+## v0.34.18
+
+### BREAKING CHANGES
+
+- CLI/RPC/Config
+    - [cli] [\#8258](https://github.com/tendermint/tendermint/pull/8258) Fix a bug in the cli that caused `unsafe-reset-all` to panic
+
+## v0.34.17
+
+### BREAKING CHANGES
+
+- CLI/RPC/Config
+
+   - [cli] [\#8081](https://github.com/tendermint/tendermint/issues/8081) make the reset command safe to use (@marbar3778).
+
+### BUG FIXES
+
+- [consensus] [\#8079](https://github.com/tendermint/tendermint/issues/8079) start the timeout ticker before relay (backport #7844) (@creachadair).
+- [consensus] [\#7992](https://github.com/tendermint/tendermint/issues/7992) [\#7994](https://github.com/tendermint/tendermint/issues/7994) change lock handling in handleMsg and reactor to alleviate issues gossiping during long ABCI calls (@williambanfield).
 
 ## v0.34.16
 
@@ -594,7 +747,7 @@ Special thanks to external contributors on this release: @james-ray, @fedekunze,
   - [light] [\#5347](https://github.com/tendermint/tendermint/pull/5347) `NewClient`, `NewHTTPClient`, `VerifyHeader` and `VerifyLightBlockAtHeight` now accept `context.Context` as 1st param (@melekes)
   - [merkle] [\#5193](https://github.com/tendermint/tendermint/pull/5193) `HashFromByteSlices` and `ProofsFromByteSlices` now return a hash for empty inputs, following RFC6962 (@erikgrinaker)
   - [proto] [\#5025](https://github.com/tendermint/tendermint/pull/5025) All proto files have been moved to `/proto` directory. (@marbar3778)
-    - Using the recommended the file layout from buf, [see here for more info](https://buf.build/docs/lint-checkers#file_layout)
+    - Using the recommended the file layout from buf, [see here for more info](https://docs.buf.build/lint/rules) <!-- markdown-link-check-disable-line -->
   - [rpc/client] [\#4947](https://github.com/tendermint/tendermint/pull/4947) `Validators`, `TxSearch` `page`/`per_page` params become pointers (@melekes)
     - `UnconfirmedTxs` `limit` param is a pointer
   - [rpc/jsonrpc/server] [\#5141](https://github.com/tendermint/tendermint/pull/5141) Remove `WriteRPCResponseArrayHTTP` (use `WriteRPCResponseHTTP` instead) (@melekes)
@@ -1374,7 +1527,7 @@ Special thanks to external contributors on this release: @jon-certik, @gracenoah
 *August 28, 2019*
 
 @climber73 wrote the [Writing a Tendermint Core application in Java
-(gRPC)](https://github.com/tendermint/tendermint/blob/master/docs/guides/java.md)
+(gRPC)](https://github.com/tendermint/tendermint/blob/master/docs/guides/java.md) <!-- markdown-link-check-disable-line -->
 guide.
 
 Special thanks to external contributors on this release:
@@ -1953,7 +2106,7 @@ more details.
   - [rpc] [\#3269](https://github.com/tendermint/tendermint/issues/2826) Limit number of unique clientIDs with open subscriptions. Configurable via `rpc.max_subscription_clients`
   - [rpc] [\#3269](https://github.com/tendermint/tendermint/issues/2826) Limit number of unique queries a given client can subscribe to at once. Configurable via `rpc.max_subscriptions_per_client`.
   - [rpc] [\#3435](https://github.com/tendermint/tendermint/issues/3435) Default ReadTimeout and WriteTimeout changed to 10s. WriteTimeout can increased by setting `rpc.timeout_broadcast_tx_commit` in the config.
-  - [rpc/client] [\#3269](https://github.com/tendermint/tendermint/issues/3269) Update `EventsClient` interface to reflect new pubsub/eventBus API [ADR-33](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-033-pubsub.md). This includes `Subscribe`, `Unsubscribe`, and `UnsubscribeAll` methods.
+  - [rpc/client] [\#3269](https://github.com/tendermint/tendermint/issues/3269) Update `EventsClient` interface to reflect new pubsub/eventBus API [ADR-33](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-033-pubsub.md). This includes `Subscribe`, `Unsubscribe`, and `UnsubscribeAll` methods.
 
 * Apps
   - [abci] [\#3403](https://github.com/tendermint/tendermint/issues/3403) Remove `time_iota_ms` from BlockParams. This is a
@@ -2006,7 +2159,7 @@ more details.
 - [blockchain] [\#3358](https://github.com/tendermint/tendermint/pull/3358) Fix timer leak in `BlockPool` (@guagualvcha)
 - [cmd] [\#3408](https://github.com/tendermint/tendermint/issues/3408) Fix `testnet` command's panic when creating non-validator configs (using `--n` flag) (@srmo)
 - [libs/db/remotedb/grpcdb] [\#3402](https://github.com/tendermint/tendermint/issues/3402) Close Iterator/ReverseIterator after use
-- [libs/pubsub] [\#951](https://github.com/tendermint/tendermint/issues/951), [\#1880](https://github.com/tendermint/tendermint/issues/1880) Use non-blocking send when dispatching messages [ADR-33](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-033-pubsub.md)
+- [libs/pubsub] [\#951](https://github.com/tendermint/tendermint/issues/951), [\#1880](https://github.com/tendermint/tendermint/issues/1880) Use non-blocking send when dispatching messages [ADR-33](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-033-pubsub.md)
 - [lite] [\#3364](https://github.com/tendermint/tendermint/issues/3364) Fix `/validators` and `/abci_query` proxy endpoints
   (@guagualvcha)
 - [p2p/conn] [\#3347](https://github.com/tendermint/tendermint/issues/3347) Reject all-zero shared secrets in the Diffie-Hellman step of secret-connection
@@ -2067,7 +2220,7 @@ handshake by authenticating the NetAddress.ID of the peer we're dialing.
 This release fixes yet another issue with the proposer selection algorithm.
 We hope it's the last one, but we won't be surprised if it's not.
 We plan to one day expose the selection algorithm more directly to
-the application ([\#3285](https://github.com/tendermint/tendermint/issues/3285)), and even to support randomness ([\#763](https://github.com/tendermint/tendermint/issues/763)).
+the application ([\#3285](https://github.com/tendermint/tendermint/issues/3285)), and even to support randomness ([\#763](https://github.com/tendermint/tendermint/issues/763)). <!-- markdown-link-check-disable-line -->
 For more, see issues marked
 [proposer-selection](https://github.com/tendermint/tendermint/labels/proposer-selection).
 
@@ -2710,7 +2863,7 @@ Special thanks to external contributors on this release:
 This release is mostly about the ConsensusParams - removing fields and enforcing MaxGas.
 It also addresses some issues found via security audit, removes various unused
 functions from `libs/common`, and implements
-[ADR-012](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-012-peer-transport.md).
+[ADR-012](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-012-peer-transport.md).
 
 BREAKING CHANGES:
 
@@ -2775,7 +2928,7 @@ are affected by a change.
 
 A few more breaking changes are in the works - each will come with a clear
 Architecture Decision Record (ADR) explaining the change. You can review ADRs
-[here](https://github.com/tendermint/tendermint/tree/develop/docs/architecture)
+[here](https://github.com/tendermint/tendermint/tree/master/docs/architecture)
 or in the [open Pull Requests](https://github.com/tendermint/tendermint/pulls).
 You can also check in on the [issues marked as
 breaking](https://github.com/tendermint/tendermint/issues?q=is%3Aopen+is%3Aissue+label%3Abreaking).
@@ -2791,7 +2944,7 @@ BREAKING CHANGES:
   - [abci] Added address of the original proposer of the block to Header
   - [abci] Change ABCI Header to match Tendermint exactly
   - [abci] [\#2159](https://github.com/tendermint/tendermint/issues/2159) Update use of `Validator` (see
-    [ADR-018](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-018-ABCI-Validators.md)):
+    [ADR-018](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-018-ABCI-Validators.md)):
     - Remove PubKey from `Validator` (so it's just Address and Power)
     - Introduce `ValidatorUpdate` (with just PubKey and Power)
     - InitChain and EndBlock use ValidatorUpdate
@@ -2813,7 +2966,7 @@ BREAKING CHANGES:
   - [state] [\#1815](https://github.com/tendermint/tendermint/issues/1815) Validator set changes are now delayed by one block (!)
     - Add NextValidatorSet to State, changes on-disk representation of state
   - [state] [\#2184](https://github.com/tendermint/tendermint/issues/2184) Enforce ConsensusParams.BlockSize.MaxBytes (See
-    [ADR-020](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-020-block-size.md)).
+    [ADR-020](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-020-block-size.md)).
     - Remove ConsensusParams.BlockSize.MaxTxs
     - Introduce maximum sizes for all components of a block, including ChainID
   - [types] Updates to the block Header:
@@ -2824,7 +2977,7 @@ BREAKING CHANGES:
   - [consensus] [\#2203](https://github.com/tendermint/tendermint/issues/2203) Implement BFT time
     - Timestamp in block must be monotonic and equal the median of timestamps in block's LastCommit
   - [crypto] [\#2239](https://github.com/tendermint/tendermint/issues/2239) Secp256k1 signature changes (See
-    [ADR-014](https://github.com/tendermint/tendermint/blob/develop/docs/architecture/adr-014-secp-malleability.md)):
+    [ADR-014](https://github.com/tendermint/tendermint/blob/master/docs/architecture/adr-014-secp-malleability.md)):
     - format changed from DER to `r || s`, both little endian encoded as 32 bytes.
     - malleability removed by requiring `s` to be in canonical form.
 
@@ -3054,7 +3207,7 @@ BREAKING CHANGES:
 FEATURES
 - [cmd] Added metrics (served under `/metrics` using a Prometheus client;
   disabled by default). See the new `instrumentation` section in the config and
-  [metrics](https://tendermint.readthedocs.io/projects/tools/en/develop/metrics.html)
+  [metrics](https://github.com/tendermint/tendermint/blob/master/docs/nodes/metrics.md)
   guide.
 - [p2p] Add IPv6 support to peering.
 - [p2p] Add `external_address` to config to allow specifying the address for
@@ -3168,7 +3321,7 @@ BREAKING:
 
 FEATURES
 
-- [rpc] the RPC documentation is now published to https://tendermint.github.io/slate
+- [rpc] the RPC documentation is now published to `https://tendermint.github.io/slate`
 - [p2p] AllowDuplicateIP config option to refuse connections from same IP.
     - true by default for now, false by default in next breaking release
 - [docs] Add docs for query, tx indexing, events, pubsub
@@ -3646,7 +3799,7 @@ containing substructs: `BaseConfig`, `P2PConfig`, `MempoolConfig`, `ConsensusCon
   - Change some [function and method signatures](https://gist.github.com/ebuchman/640d5fc6c2605f73497992fe107ebe0b) accomodate new config
 
 - Logger
-  - Replace static `log15` logger with a simple interface, and provide a new implementation using `go-kit`.
+  - Replace static `log15` logger with a simple interface, and provide a new implementation using `go-kit`. <!-- markdown-link-check-disable-next-line -->
 See our new [logging library](https://github.com/tendermint/tmlibs/log) and [blog post](https://tendermint.com/blog/abstracting-the-logger-interface-in-go) for more details
   - Levels `warn` and `notice` are removed (you may need to change them in your `config.toml`!)
   - Change some [function and method signatures](https://gist.github.com/ebuchman/640d5fc6c2605f73497992fe107ebe0b) to accept a logger

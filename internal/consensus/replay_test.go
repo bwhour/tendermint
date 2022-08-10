@@ -118,8 +118,9 @@ func sendTxs(ctx context.Context, t *testing.T, cs *State) {
 
 // TestWALCrash uses crashing WAL to test we can recover from any WAL failure.
 func TestWALCrash(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	if testing.Short() {
+		t.Skip("skipping test in short mode")
+	}
 
 	testCases := []struct {
 		name         string
@@ -139,6 +140,9 @@ func TestWALCrash(t *testing.T) {
 	for _, tc := range testCases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
 			consensusReplayConfig, err := ResetConfig(t.TempDir(), tc.name)
 			require.NoError(t, err)
 			crashWALandCheckLiveness(ctx, t, consensusReplayConfig, tc.initFn, tc.heightToStop)
@@ -297,7 +301,7 @@ type simulatorTestSuite struct {
 	GenesisState sm.State
 	Config       *config.Config
 	Chain        []*types.Block
-	Commits      []*types.Commit
+	ExtCommits   []*types.ExtendedCommit
 	CleanupFunc  cleanupFunc
 
 	Mempool mempool.Mempool
@@ -578,11 +582,11 @@ func setupSimulator(ctx context.Context, t *testing.T) *simulatorTestSuite {
 	}
 	ensureNewRound(t, newRoundCh, height+1, 0)
 
-	sim.Chain = make([]*types.Block, 0)
-	sim.Commits = make([]*types.Commit, 0)
+	sim.Chain = []*types.Block{}
+	sim.ExtCommits = []*types.ExtendedCommit{}
 	for i := 1; i <= numBlocks; i++ {
 		sim.Chain = append(sim.Chain, css[0].blockStore.LoadBlock(int64(i)))
-		sim.Commits = append(sim.Commits, css[0].blockStore.LoadBlockCommit(int64(i)))
+		sim.ExtCommits = append(sim.ExtCommits, css[0].blockStore.LoadBlockExtendedCommit(int64(i)))
 	}
 
 	return sim
@@ -679,7 +683,7 @@ func testHandshakeReplay(
 	testValidatorsChange bool,
 ) {
 	var chain []*types.Block
-	var commits []*types.Commit
+	var extCommits []*types.ExtendedCommit
 	var store *mockBlockStore
 	var stateDB dbm.DB
 	var genesisState sm.State
@@ -699,7 +703,7 @@ func testHandshakeReplay(
 		genesisState = sim.GenesisState
 		cfg = sim.Config
 		chain = append([]*types.Block{}, sim.Chain...) // copy chain
-		commits = sim.Commits
+		extCommits = sim.ExtCommits
 		store = newMockBlockStore(t, cfg, genesisState.ConsensusParams)
 	} else { // test single node
 		testConfig, err := ResetConfig(t.TempDir(), fmt.Sprintf("%s_%v_s", t.Name(), mode))
@@ -718,7 +722,7 @@ func testHandshakeReplay(
 		err = wal.Start(ctx)
 		require.NoError(t, err)
 		t.Cleanup(func() { cancel(); wal.Wait() })
-		chain, commits = makeBlockchainFromWAL(t, wal)
+		chain, extCommits = makeBlockchainFromWAL(t, wal)
 		pubKey, err := privVal.GetPubKey(ctx)
 		require.NoError(t, err)
 		stateDB, genesisState, store = stateAndStore(t, cfg, pubKey, kvstore.ProtocolVersion)
@@ -726,7 +730,7 @@ func testHandshakeReplay(
 	}
 	stateStore := sm.NewStore(stateDB)
 	store.chain = chain
-	store.commits = commits
+	store.extCommits = extCommits
 
 	state := genesisState.Copy()
 	// run the chain through state.ApplyBlock to build up the tendermint state
@@ -788,7 +792,7 @@ func testHandshakeReplay(
 	require.NoError(t, err, "Error on abci handshake")
 
 	// get the latest app hash from the app
-	res, err := proxyApp.Info(ctx, abci.RequestInfo{Version: ""})
+	res, err := proxyApp.Info(ctx, &abci.RequestInfo{Version: ""})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -826,7 +830,7 @@ func applyBlock(
 	eventBus *eventbus.EventBus,
 ) sm.State {
 	testPartSize := types.BlockPartSizeBytes
-	blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), appClient, mempool, evpool, blockStore, eventBus)
+	blockExec := sm.NewBlockExecutor(stateStore, log.NewNopLogger(), appClient, mempool, evpool, blockStore, eventBus, sm.NopMetrics())
 
 	bps, err := blk.MakePartSet(testPartSize)
 	require.NoError(t, err)
@@ -856,7 +860,7 @@ func buildAppStateFromChain(
 
 	state.Version.Consensus.App = kvstore.ProtocolVersion // simulate handshake, receive app version
 	validators := types.TM2PB.ValidatorUpdates(state.Validators)
-	_, err := appClient.InitChain(ctx, abci.RequestInitChain{
+	_, err := appClient.InitChain(ctx, &abci.RequestInitChain{
 		Validators: validators,
 	})
 	require.NoError(t, err)
@@ -910,7 +914,7 @@ func buildTMStateFromChain(
 
 	state.Version.Consensus.App = kvstore.ProtocolVersion // simulate handshake, receive app version
 	validators := types.TM2PB.ValidatorUpdates(state.Validators)
-	_, err := proxyApp.InitChain(ctx, abci.RequestInitChain{
+	_, err := proxyApp.InitChain(ctx, &abci.RequestInitChain{
 		Validators: validators,
 	})
 	require.NoError(t, err)
@@ -944,7 +948,7 @@ func buildTMStateFromChain(
 	return state
 }
 
-func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
+func TestHandshakeErrorsIfAppReturnsWrongAppHash(t *testing.T) {
 	// 1. Initialize tendermint and commit 3 blocks with the following app hashes:
 	//		- 0x01
 	//		- 0x02
@@ -988,12 +992,8 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { cancel(); proxyApp.Wait() })
 
-		assert.Panics(t, func() {
-			h := NewHandshaker(logger, stateStore, state, store, eventBus, genDoc)
-			if err = h.Handshake(ctx, proxyApp); err != nil {
-				t.Log(err)
-			}
-		})
+		h := NewHandshaker(logger, stateStore, state, store, eventBus, genDoc)
+		assert.Error(t, h.Handshake(ctx, proxyApp))
 	}
 
 	// 3. Tendermint must panic if app returns wrong hash for the last block
@@ -1008,12 +1008,8 @@ func TestHandshakePanicsIfAppReturnsWrongAppHash(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { cancel(); proxyApp.Wait() })
 
-		assert.Panics(t, func() {
-			h := NewHandshaker(logger, stateStore, state, store, eventBus, genDoc)
-			if err = h.Handshake(ctx, proxyApp); err != nil {
-				t.Log(err)
-			}
-		})
+		h := NewHandshaker(logger, stateStore, state, store, eventBus, genDoc)
+		require.Error(t, h.Handshake(ctx, proxyApp))
 	}
 }
 
@@ -1025,15 +1021,15 @@ type badApp struct {
 	onlyLastHashIsWrong bool
 }
 
-func (app *badApp) Commit() abci.ResponseCommit {
+func (app *badApp) FinalizeBlock(_ context.Context, _ *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
 	app.height++
 	if app.onlyLastHashIsWrong {
 		if app.height == app.numBlocks {
-			return abci.ResponseCommit{Data: tmrand.Bytes(8)}
+			return &abci.ResponseFinalizeBlock{AppHash: tmrand.Bytes(8)}, nil
 		}
-		return abci.ResponseCommit{Data: []byte{app.height}}
+		return &abci.ResponseFinalizeBlock{AppHash: []byte{app.height}}, nil
 	} else if app.allHashesAreWrong {
-		return abci.ResponseCommit{Data: tmrand.Bytes(8)}
+		return &abci.ResponseFinalizeBlock{AppHash: tmrand.Bytes(8)}, nil
 	}
 
 	panic("either allHashesAreWrong or onlyLastHashIsWrong must be set")
@@ -1042,7 +1038,7 @@ func (app *badApp) Commit() abci.ResponseCommit {
 //--------------------------
 // utils for making blocks
 
-func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.Commit) {
+func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.ExtendedCommit) {
 	t.Helper()
 	var height int64
 
@@ -1055,10 +1051,10 @@ func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.Comm
 	// log.Notice("Build a blockchain by reading from the WAL")
 
 	var (
-		blocks          []*types.Block
-		commits         []*types.Commit
-		thisBlockParts  *types.PartSet
-		thisBlockCommit *types.Commit
+		blocks             []*types.Block
+		extCommits         []*types.ExtendedCommit
+		thisBlockParts     *types.PartSet
+		thisBlockExtCommit *types.ExtendedCommit
 	)
 
 	dec := NewWALDecoder(gr)
@@ -1090,12 +1086,12 @@ func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.Comm
 				require.Equal(t, block.Height, height+1,
 					"read bad block from wal. got height %d, expected %d", block.Height, height+1)
 
-				commitHeight := thisBlockCommit.Height
+				commitHeight := thisBlockExtCommit.Height
 				require.Equal(t, commitHeight, height+1,
 					"commit doesnt match. got height %d, expected %d", commitHeight, height+1)
 
 				blocks = append(blocks, block)
-				commits = append(commits, thisBlockCommit)
+				extCommits = append(extCommits, thisBlockExtCommit)
 				height++
 			}
 		case *types.PartSetHeader:
@@ -1105,8 +1101,12 @@ func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.Comm
 			require.NoError(t, err)
 		case *types.Vote:
 			if p.Type == tmproto.PrecommitType {
-				thisBlockCommit = types.NewCommit(p.Height, p.Round,
-					p.BlockID, []types.CommitSig{p.CommitSig()})
+				thisBlockExtCommit = &types.ExtendedCommit{
+					Height:             p.Height,
+					Round:              p.Round,
+					BlockID:            p.BlockID,
+					ExtendedSignatures: []types.ExtendedCommitSig{p.ExtendedCommitSig()},
+				}
 			}
 		}
 	}
@@ -1121,12 +1121,12 @@ func makeBlockchainFromWAL(t *testing.T, wal WAL) ([]*types.Block, []*types.Comm
 	require.NoError(t, err)
 
 	require.Equal(t, block.Height, height+1, "read bad block from wal. got height %d, expected %d", block.Height, height+1)
-	commitHeight := thisBlockCommit.Height
+	commitHeight := thisBlockExtCommit.Height
 	require.Equal(t, commitHeight, height+1, "commit does not match. got height %d, expected %d", commitHeight, height+1)
 
 	blocks = append(blocks, block)
-	commits = append(commits, thisBlockCommit)
-	return blocks, commits
+	extCommits = append(extCommits, thisBlockExtCommit)
+	return blocks, extCommits
 }
 
 func readPieceFromWAL(msg *TimedWALMessage) interface{} {
@@ -1170,13 +1170,15 @@ func stateAndStore(
 // mock block store
 
 type mockBlockStore struct {
-	cfg     *config.Config
-	params  types.ConsensusParams
-	chain   []*types.Block
-	commits []*types.Commit
-	base    int64
-	t       *testing.T
+	cfg        *config.Config
+	params     types.ConsensusParams
+	chain      []*types.Block
+	extCommits []*types.ExtendedCommit
+	base       int64
+	t          *testing.T
 }
+
+var _ sm.BlockStore = &mockBlockStore{}
 
 // TODO: NewBlockStore(db.NewMemDB) ...
 func newMockBlockStore(t *testing.T, cfg *config.Config, params types.ConsensusParams) *mockBlockStore {
@@ -1206,20 +1208,26 @@ func (bs *mockBlockStore) LoadBlockMeta(height int64) *types.BlockMeta {
 	}
 }
 func (bs *mockBlockStore) LoadBlockPart(height int64, index int) *types.Part { return nil }
+func (bs *mockBlockStore) SaveBlockWithExtendedCommit(block *types.Block, blockParts *types.PartSet, seenCommit *types.ExtendedCommit) {
+}
 func (bs *mockBlockStore) SaveBlock(block *types.Block, blockParts *types.PartSet, seenCommit *types.Commit) {
 }
+
 func (bs *mockBlockStore) LoadBlockCommit(height int64) *types.Commit {
-	return bs.commits[height-1]
+	return bs.extCommits[height-1].ToCommit()
 }
 func (bs *mockBlockStore) LoadSeenCommit() *types.Commit {
-	return bs.commits[len(bs.commits)-1]
+	return bs.extCommits[len(bs.extCommits)-1].ToCommit()
+}
+func (bs *mockBlockStore) LoadBlockExtendedCommit(height int64) *types.ExtendedCommit {
+	return bs.extCommits[height-1]
 }
 
 func (bs *mockBlockStore) PruneBlocks(height int64) (uint64, error) {
 	pruned := uint64(0)
 	for i := int64(0); i < height-1; i++ {
 		bs.chain[i] = nil
-		bs.commits[i] = nil
+		bs.extCommits[i] = nil
 		pruned++
 	}
 	bs.base = height
@@ -1283,8 +1291,6 @@ type initChainApp struct {
 	vals []abci.ValidatorUpdate
 }
 
-func (ica *initChainApp) InitChain(req abci.RequestInitChain) abci.ResponseInitChain {
-	return abci.ResponseInitChain{
-		Validators: ica.vals,
-	}
+func (ica *initChainApp) InitChain(_ context.Context, req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+	return &abci.ResponseInitChain{Validators: ica.vals}, nil
 }

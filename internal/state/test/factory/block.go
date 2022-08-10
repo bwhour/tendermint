@@ -45,7 +45,7 @@ func MakeBlocks(ctx context.Context, t *testing.T, n int, state *sm.State, privV
 func MakeBlock(state sm.State, height int64, c *types.Commit) *types.Block {
 	return state.MakeBlock(
 		height,
-		factory.MakeTenTxs(state.LastBlockHeight),
+		factory.MakeNTxs(state.LastBlockHeight, 10),
 		c,
 		nil,
 		state.Validators.GetProposer().Address,
@@ -63,7 +63,7 @@ func makeBlockAndPartSet(
 ) (*types.Block, *types.PartSet) {
 	t.Helper()
 
-	lastCommit := types.NewCommit(height-1, 0, types.BlockID{}, nil)
+	lastCommit := &types.Commit{Height: height - 1}
 	if height > 1 {
 		vote, err := factory.MakeVote(
 			ctx,
@@ -73,8 +73,12 @@ func makeBlockAndPartSet(
 			lastBlockMeta.BlockID,
 			time.Now())
 		require.NoError(t, err)
-		lastCommit = types.NewCommit(vote.Height, vote.Round,
-			lastBlockMeta.BlockID, []types.CommitSig{vote.CommitSig()})
+		lastCommit = &types.Commit{
+			Height:     vote.Height,
+			Round:      vote.Round,
+			BlockID:    lastBlock.LastBlockID,
+			Signatures: []types.CommitSig{vote.CommitSig()},
+		}
 	}
 
 	block := state.MakeBlock(height, []types.Tx{}, lastCommit, nil, state.Validators.GetProposer().Address)

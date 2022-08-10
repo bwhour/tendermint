@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 
 	"github.com/gogo/protobuf/jsonpb"
-
-	types "github.com/tendermint/tendermint/proto/tendermint/types"
+	"github.com/tendermint/tendermint/crypto"
+	"github.com/tendermint/tendermint/crypto/encoding"
+	"github.com/tendermint/tendermint/internal/jsontypes"
 )
 
 const (
@@ -51,14 +52,6 @@ func (r ResponseQuery) IsOK() bool {
 // IsErr returns true if Code is something other than OK.
 func (r ResponseQuery) IsErr() bool {
 	return r.Code != CodeTypeOK
-}
-
-func (r ResponsePrepareProposal) IsTxStatusUnknown() bool {
-	return r.ModifiedTxStatus == ResponsePrepareProposal_UNKNOWN
-}
-
-func (r ResponsePrepareProposal) IsTxStatusModified() bool {
-	return r.ModifiedTxStatus == ResponsePrepareProposal_MODIFIED
 }
 
 func (r ResponseProcessProposal) IsAccepted() bool {
@@ -145,6 +138,48 @@ func (r *EventAttribute) UnmarshalJSON(b []byte) error {
 	return jsonpbUnmarshaller.Unmarshal(reader, r)
 }
 
+// validatorUpdateJSON is the JSON encoding of a validator update.
+//
+// It handles translation of public keys from the protobuf representation to
+// the legacy Amino-compatible format expected by RPC clients.
+type validatorUpdateJSON struct {
+	PubKey json.RawMessage `json:"pub_key,omitempty"`
+	Power  int64           `json:"power,string"`
+}
+
+func (v *ValidatorUpdate) MarshalJSON() ([]byte, error) {
+	key, err := encoding.PubKeyFromProto(v.PubKey)
+	if err != nil {
+		return nil, err
+	}
+	jkey, err := jsontypes.Marshal(key)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(validatorUpdateJSON{
+		PubKey: jkey,
+		Power:  v.GetPower(),
+	})
+}
+
+func (v *ValidatorUpdate) UnmarshalJSON(data []byte) error {
+	var vu validatorUpdateJSON
+	if err := json.Unmarshal(data, &vu); err != nil {
+		return err
+	}
+	var key crypto.PubKey
+	if err := jsontypes.Unmarshal(vu.PubKey, &key); err != nil {
+		return err
+	}
+	pkey, err := encoding.PubKeyToProto(key)
+	if err != nil {
+		return err
+	}
+	v.PubKey = pkey
+	v.Power = vu.Power
+	return nil
+}
+
 // Some compile time assertions to ensure we don't
 // have accidental runtime surprises later on.
 
@@ -164,15 +199,6 @@ var _ jsonRoundTripper = (*EventAttribute)(nil)
 
 // -----------------------------------------------
 // construct Result data
-
-func RespondExtendVote(appDataToSign, appDataSelfAuthenticating []byte) ResponseExtendVote {
-	return ResponseExtendVote{
-		VoteExtension: &types.VoteExtension{
-			AppDataToSign:             appDataToSign,
-			AppDataSelfAuthenticating: appDataSelfAuthenticating,
-		},
-	}
-}
 
 func RespondVerifyVoteExtension(ok bool) ResponseVerifyVoteExtension {
 	status := ResponseVerifyVoteExtension_REJECT

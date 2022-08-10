@@ -54,8 +54,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	assert.False(t, indexer.IndexingEnabled([]indexer.EventSink{}))
 
 	// event sink setup
-	pool, err := setupDB(t)
-	assert.NoError(t, err)
+	pool := setupDB(t)
 
 	store := dbm.NewMemDB()
 	eventSinks := []indexer.EventSink{kv.NewEventSink(store), pSink}
@@ -71,7 +70,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	t.Cleanup(service.Wait)
 
 	// publish block with txs
-	err = eventBus.PublishEventNewBlockHeader(ctx, types.EventDataNewBlockHeader{
+	err = eventBus.PublishEventNewBlockHeader(types.EventDataNewBlockHeader{
 		Header: types.Header{Height: 1},
 		NumTxs: int64(2),
 	})
@@ -82,7 +81,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 		Tx:     types.Tx("foo"),
 		Result: abci.ExecTxResult{Code: 0},
 	}
-	err = eventBus.PublishEventTx(ctx, types.EventDataTx{TxResult: *txResult1})
+	err = eventBus.PublishEventTx(types.EventDataTx{TxResult: *txResult1})
 	require.NoError(t, err)
 	txResult2 := &abci.TxResult{
 		Height: 1,
@@ -90,7 +89,7 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 		Tx:     types.Tx("bar"),
 		Result: abci.ExecTxResult{Code: 0},
 	}
-	err = eventBus.PublishEventTx(ctx, types.EventDataTx{TxResult: *txResult2})
+	err = eventBus.PublishEventTx(types.EventDataTx{TxResult: *txResult2})
 	require.NoError(t, err)
 
 	time.Sleep(100 * time.Millisecond)
@@ -108,6 +107,165 @@ func TestIndexerServiceIndexesBlocks(t *testing.T) {
 	require.Equal(t, txResult2, res)
 
 	assert.Nil(t, teardown(t, pool))
+}
+
+func TestTxIndexDuplicatedTx(t *testing.T) {
+	var mockTx = types.Tx("MOCK_TX_HASH")
+
+	testCases := []struct {
+		name    string
+		tx1     abci.TxResult
+		tx2     abci.TxResult
+		expSkip bool // do we expect the second tx to be skipped by tx indexer
+	}{
+		{"skip, previously successful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK,
+				},
+			},
+			abci.TxResult{
+				Height: 2,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			true,
+		},
+		{"not skip, previously unsuccessful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			abci.TxResult{
+				Height: 2,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			false,
+		},
+		{"not skip, both successful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK,
+				},
+			},
+			abci.TxResult{
+				Height: 2,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK,
+				},
+			},
+			false,
+		},
+		{"not skip, both unsuccessful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			abci.TxResult{
+				Height: 2,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			false,
+		},
+		{"skip, same block, previously successful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK,
+				},
+			},
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			true,
+		},
+		{"not skip, same block, previously unsuccessful",
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK + 1,
+				},
+			},
+			abci.TxResult{
+				Height: 1,
+				Index:  0,
+				Tx:     mockTx,
+				Result: abci.ExecTxResult{
+					Code: abci.CodeTypeOK,
+				},
+			},
+			false,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := kv.NewEventSink(dbm.NewMemDB())
+
+			if tc.tx1.Height != tc.tx2.Height {
+				// index the first tx
+				err := sink.IndexTxEvents([]*abci.TxResult{&tc.tx1})
+				require.NoError(t, err)
+
+				// check if the second one should be skipped.
+				ops, err := indexer.DeduplicateBatch([]*abci.TxResult{&tc.tx2}, sink)
+				require.NoError(t, err)
+
+				if tc.expSkip {
+					require.Empty(t, ops)
+				} else {
+					require.Equal(t, []*abci.TxResult{&tc.tx2}, ops)
+				}
+			} else {
+				// same block
+				ops := []*abci.TxResult{&tc.tx1, &tc.tx2}
+				ops, err := indexer.DeduplicateBatch(ops, sink)
+				require.NoError(t, err)
+				if tc.expSkip {
+					// the second one is skipped
+					require.Equal(t, []*abci.TxResult{&tc.tx1}, ops)
+				} else {
+					require.Equal(t, []*abci.TxResult{&tc.tx1, &tc.tx2}, ops)
+				}
+			}
+		})
+	}
 }
 
 func readSchema() ([]*schema.Migration, error) {
@@ -133,7 +291,7 @@ func resetDB(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func setupDB(t *testing.T) (*dockertest.Pool, error) {
+func setupDB(t *testing.T) *dockertest.Pool {
 	t.Helper()
 	pool, err := dockertest.NewPool(os.Getenv("DOCKER_URL"))
 	assert.NoError(t, err)
@@ -187,7 +345,7 @@ func setupDB(t *testing.T) (*dockertest.Pool, error) {
 	err = migrator.Apply(psqldb, sm)
 	assert.NoError(t, err)
 
-	return pool, nil
+	return pool
 }
 
 func teardown(t *testing.T, pool *dockertest.Pool) error {

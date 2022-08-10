@@ -1,6 +1,7 @@
 package types
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"time"
@@ -8,8 +9,7 @@ import (
 	"github.com/tendermint/tendermint/crypto/ed25519"
 	"github.com/tendermint/tendermint/crypto/secp256k1"
 	"github.com/tendermint/tendermint/crypto/sr25519"
-	"github.com/tendermint/tendermint/crypto/tmhash"
-	tmstrings "github.com/tendermint/tendermint/libs/strings"
+	tmstrings "github.com/tendermint/tendermint/internal/libs/strings"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
 )
 
@@ -43,6 +43,7 @@ type ConsensusParams struct {
 	Version   VersionParams   `json:"version"`
 	Synchrony SynchronyParams `json:"synchrony"`
 	Timeout   TimeoutParams   `json:"timeout"`
+	ABCI      ABCIParams      `json:"abci"`
 }
 
 // HashedParams is a subset of ConsensusParams.
@@ -96,6 +97,22 @@ type TimeoutParams struct {
 	BypassCommitTimeout bool          `json:"bypass_commit_timeout"`
 }
 
+// ABCIParams configure ABCI functionality specific to the Application Blockchain
+// Interface.
+type ABCIParams struct {
+	VoteExtensionsEnableHeight int64 `json:"vote_extensions_enable_height"`
+	RecheckTx                  bool  `json:"recheck_tx"`
+}
+
+// VoteExtensionsEnabled returns true if vote extensions are enabled at height h
+// and false otherwise.
+func (a ABCIParams) VoteExtensionsEnabled(h int64) bool {
+	if a.VoteExtensionsEnableHeight == 0 {
+		return false
+	}
+	return a.VoteExtensionsEnableHeight <= h
+}
+
 // DefaultConsensusParams returns a default ConsensusParams.
 func DefaultConsensusParams() *ConsensusParams {
 	return &ConsensusParams{
@@ -105,6 +122,7 @@ func DefaultConsensusParams() *ConsensusParams {
 		Version:   DefaultVersionParams(),
 		Synchrony: DefaultSynchronyParams(),
 		Timeout:   DefaultTimeoutParams(),
+		ABCI:      DefaultABCIParams(),
 	}
 }
 
@@ -147,7 +165,22 @@ func DefaultSynchronyParams() SynchronyParams {
 		Precision:    505 * time.Millisecond,
 		MessageDelay: 12 * time.Second,
 	}
+}
 
+// SynchronyParamsOrDefaults returns the SynchronyParams, filling in any zero values
+// with the Tendermint defined default values.
+func (s SynchronyParams) SynchronyParamsOrDefaults() SynchronyParams {
+	// TODO: Remove this method and all uses once development on v0.37 begins.
+	// See: https://github.com/tendermint/tendermint/issues/8187
+
+	defaults := DefaultSynchronyParams()
+	if s.Precision == 0 {
+		s.Precision = defaults.Precision
+	}
+	if s.MessageDelay == 0 {
+		s.MessageDelay = defaults.MessageDelay
+	}
+	return s
 }
 
 func DefaultTimeoutParams() TimeoutParams {
@@ -159,6 +192,61 @@ func DefaultTimeoutParams() TimeoutParams {
 		Commit:              1000 * time.Millisecond,
 		BypassCommitTimeout: false,
 	}
+}
+
+func DefaultABCIParams() ABCIParams {
+	return ABCIParams{
+		// When set to 0, vote extensions are not required.
+		VoteExtensionsEnableHeight: 0,
+		// When true, run CheckTx on each transaction in the mempool after each height.
+		RecheckTx: true,
+	}
+}
+
+// TimeoutParamsOrDefaults returns the SynchronyParams, filling in any zero values
+// with the Tendermint defined default values.
+func (t TimeoutParams) TimeoutParamsOrDefaults() TimeoutParams {
+	// TODO: Remove this method and all uses once development on v0.37 begins.
+	// See: https://github.com/tendermint/tendermint/issues/8187
+
+	defaults := DefaultTimeoutParams()
+	if t.Propose == 0 {
+		t.Propose = defaults.Propose
+	}
+	if t.ProposeDelta == 0 {
+		t.ProposeDelta = defaults.ProposeDelta
+	}
+	if t.Vote == 0 {
+		t.Vote = defaults.Vote
+	}
+	if t.VoteDelta == 0 {
+		t.VoteDelta = defaults.VoteDelta
+	}
+	if t.Commit == 0 {
+		t.Commit = defaults.Commit
+	}
+	return t
+}
+
+// ProposeTimeout returns the amount of time to wait for a proposal.
+func (t TimeoutParams) ProposeTimeout(round int32) time.Duration {
+	return time.Duration(
+		t.Propose.Nanoseconds()+t.ProposeDelta.Nanoseconds()*int64(round),
+	) * time.Nanosecond
+}
+
+// VoteTimeout returns the amount of time to wait for remaining votes after receiving any +2/3 votes.
+func (t TimeoutParams) VoteTimeout(round int32) time.Duration {
+	return time.Duration(
+		t.Vote.Nanoseconds()+t.VoteDelta.Nanoseconds()*int64(round),
+	) * time.Nanosecond
+}
+
+// CommitTime accepts ti, the time at which the consensus engine received +2/3
+// precommits for a block and returns the point in time at which the consensus
+// engine should begin consensus on the next block.
+func (t TimeoutParams) CommitTime(ti time.Time) time.Time {
+	return ti.Add(t.Commit)
 }
 
 func (val *ValidatorParams) IsValidPubkeyType(pubkeyType string) bool {
@@ -226,24 +314,27 @@ func (params ConsensusParams) ValidateConsensusParams() error {
 			params.Synchrony.Precision)
 	}
 
-	if params.Timeout.Propose < 0 {
-		return fmt.Errorf("timeout.ProposeDelta must not be negative. Got: %d", params.Timeout.Propose)
+	if params.Timeout.Propose <= 0 {
+		return fmt.Errorf("timeout.ProposeDelta must be greater than 0. Got: %d", params.Timeout.Propose)
 	}
 
-	if params.Timeout.ProposeDelta < 0 {
-		return fmt.Errorf("timeout.ProposeDelta must not be negative. Got: %d", params.Timeout.ProposeDelta)
+	if params.Timeout.ProposeDelta <= 0 {
+		return fmt.Errorf("timeout.ProposeDelta must be greater than 0. Got: %d", params.Timeout.ProposeDelta)
 	}
 
-	if params.Timeout.Vote < 0 {
-		return fmt.Errorf("timeout.Vote must not be negative. Got: %d", params.Timeout.Vote)
+	if params.Timeout.Vote <= 0 {
+		return fmt.Errorf("timeout.Vote must be greater than 0. Got: %d", params.Timeout.Vote)
 	}
 
-	if params.Timeout.VoteDelta < 0 {
-		return fmt.Errorf("timeout.VoteDelta must not be negative. Got: %d", params.Timeout.VoteDelta)
+	if params.Timeout.VoteDelta <= 0 {
+		return fmt.Errorf("timeout.VoteDelta must be greater than 0. Got: %d", params.Timeout.VoteDelta)
 	}
 
-	if params.Timeout.Commit < 0 {
-		return fmt.Errorf("timeout.Commit must not be negative. Got: %d", params.Timeout.Commit)
+	if params.Timeout.Commit <= 0 {
+		return fmt.Errorf("timeout.Commit must be greater than 0. Got: %d", params.Timeout.Commit)
+	}
+	if params.ABCI.VoteExtensionsEnableHeight < 0 {
+		return fmt.Errorf("ABCI.VoteExtensionsEnableHeight cannot be negative. Got: %d", params.ABCI.VoteExtensionsEnableHeight)
 	}
 
 	if len(params.Validator.PubKeyTypes) == 0 {
@@ -262,13 +353,36 @@ func (params ConsensusParams) ValidateConsensusParams() error {
 	return nil
 }
 
+func (params ConsensusParams) ValidateUpdate(updated *tmproto.ConsensusParams, h int64) error {
+	if updated.Abci == nil {
+		return nil
+	}
+	if params.ABCI.VoteExtensionsEnableHeight == updated.Abci.VoteExtensionsEnableHeight {
+		return nil
+	}
+	if params.ABCI.VoteExtensionsEnableHeight != 0 && updated.Abci.VoteExtensionsEnableHeight == 0 {
+		return errors.New("vote extensions cannot be disabled once enabled")
+	}
+	if updated.Abci.VoteExtensionsEnableHeight <= h {
+		return fmt.Errorf("VoteExtensionsEnableHeight cannot be updated to a past height, "+
+			"initial height: %d, current height %d",
+			params.ABCI.VoteExtensionsEnableHeight, h)
+	}
+	if params.ABCI.VoteExtensionsEnableHeight <= h {
+		return fmt.Errorf("VoteExtensionsEnableHeight cannot be updated modified once"+
+			"the initial height has occurred, "+
+			"initial height: %d, current height %d",
+			params.ABCI.VoteExtensionsEnableHeight, h)
+	}
+	return nil
+}
+
 // Hash returns a hash of a subset of the parameters to store in the block header.
 // Only the Block.MaxBytes and Block.MaxGas are included in the hash.
 // This allows the ConsensusParams to evolve more without breaking the block
 // protocol. No need for a Merkle tree here, just a small struct to hash.
+// TODO: We should hash the other parameters as well
 func (params ConsensusParams) HashConsensusParams() []byte {
-	hasher := tmhash.New()
-
 	hp := tmproto.HashedParams{
 		BlockMaxBytes: params.Block.MaxBytes,
 		BlockMaxGas:   params.Block.MaxGas,
@@ -279,11 +393,9 @@ func (params ConsensusParams) HashConsensusParams() []byte {
 		panic(err)
 	}
 
-	_, err = hasher.Write(bz)
-	if err != nil {
-		panic(err)
-	}
-	return hasher.Sum(nil)
+	sum := sha256.Sum256(bz)
+
+	return sum[:]
 }
 
 func (params *ConsensusParams) Equals(params2 *ConsensusParams) bool {
@@ -292,6 +404,7 @@ func (params *ConsensusParams) Equals(params2 *ConsensusParams) bool {
 		params.Version == params2.Version &&
 		params.Synchrony == params2.Synchrony &&
 		params.Timeout == params2.Timeout &&
+		params.ABCI == params2.ABCI &&
 		tmstrings.StringSliceEqual(params.Validator.PubKeyTypes, params2.Validator.PubKeyTypes)
 }
 
@@ -348,6 +461,10 @@ func (params ConsensusParams) UpdateConsensusParams(params2 *tmproto.ConsensusPa
 		}
 		res.Timeout.BypassCommitTimeout = params2.Timeout.GetBypassCommitTimeout()
 	}
+	if params2.Abci != nil {
+		res.ABCI.VoteExtensionsEnableHeight = params2.Abci.GetVoteExtensionsEnableHeight()
+		res.ABCI.RecheckTx = params2.Abci.GetRecheckTx()
+	}
 	return res
 }
 
@@ -379,6 +496,10 @@ func (params *ConsensusParams) ToProto() tmproto.ConsensusParams {
 			VoteDelta:           &params.Timeout.VoteDelta,
 			Commit:              &params.Timeout.Commit,
 			BypassCommitTimeout: params.Timeout.BypassCommitTimeout,
+		},
+		Abci: &tmproto.ABCIParams{
+			VoteExtensionsEnableHeight: params.ABCI.VoteExtensionsEnableHeight,
+			RecheckTx:                  params.ABCI.RecheckTx,
 		},
 	}
 }
@@ -426,6 +547,10 @@ func ConsensusParamsFromProto(pbParams tmproto.ConsensusParams) ConsensusParams 
 			c.Timeout.Commit = *pbParams.Timeout.GetCommit()
 		}
 		c.Timeout.BypassCommitTimeout = pbParams.Timeout.BypassCommitTimeout
+	}
+	if pbParams.Abci != nil {
+		c.ABCI.VoteExtensionsEnableHeight = pbParams.Abci.GetVoteExtensionsEnableHeight()
+		c.ABCI.RecheckTx = pbParams.Abci.GetRecheckTx()
 	}
 	return c
 }

@@ -4,6 +4,37 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    target-branch: "master"
+    open-pull-requests-limit: 10
+    labels:
+      - T:dependencies
+      - S:automerge
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: "v0.34.x"
+    open-pull-requests-limit: 10
+    labels:
+      - T:dependencies
+      - S:automerge
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: "v0.35.x"
+    open-pull-requests-limit: 10
+    labels:
+      - T:dependencies
+      - S:automerge
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: "v0.36.x"
     open-pull-requests-limit: 10
     labels:
       - T:dependencies
@@ -22,7 +53,7 @@ updates:
   - package-ecosystem: gomod
     directory: "/"
     schedule:
-      interval: daily
+      interval: weekly
     target-branch: "master"
     open-pull-requests-limit: 10
     labels:
@@ -32,7 +63,7 @@ updates:
   - package-ecosystem: gomod
     directory: "/"
     schedule:
-      interval: daily
+      interval: weekly
     target-branch: "v0.34.x"
     open-pull-requests-limit: 10
     labels:
@@ -42,8 +73,18 @@ updates:
   - package-ecosystem: gomod
     directory: "/"
     schedule:
-      interval: daily
+      interval: weekly
     target-branch: "v0.35.x"
+    open-pull-requests-limit: 10
+    labels:
+      - T:dependencies
+      - S:automerge
+
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    target-branch: "v0.36.x"
     open-pull-requests-limit: 10
     labels:
       - T:dependencies

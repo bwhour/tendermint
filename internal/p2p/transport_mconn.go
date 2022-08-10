@@ -9,6 +9,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.org/x/net/netutil"
 
@@ -78,25 +79,25 @@ func (m *MConnTransport) Protocols() []Protocol {
 	return []Protocol{MConnProtocol, TCPProtocol}
 }
 
-// Endpoints implements Transport.
-func (m *MConnTransport) Endpoints() []Endpoint {
+// Endpoint implements Transport.
+func (m *MConnTransport) Endpoint() (*Endpoint, error) {
 	if m.listener == nil {
-		return []Endpoint{}
+		return nil, errors.New("listenter not defined")
 	}
 	select {
 	case <-m.doneCh:
-		return []Endpoint{}
+		return nil, errors.New("transport closed")
 	default:
 	}
 
-	endpoint := Endpoint{
+	endpoint := &Endpoint{
 		Protocol: MConnProtocol,
 	}
 	if addr, ok := m.listener.Addr().(*net.TCPAddr); ok {
 		endpoint.IP = addr.IP
 		endpoint.Port = uint16(addr.Port)
 	}
-	return []Endpoint{endpoint}
+	return endpoint, nil
 }
 
 // Listen asynchronously listens for inbound connections on the given endpoint.
@@ -106,7 +107,7 @@ func (m *MConnTransport) Endpoints() []Endpoint {
 // FIXME: Listen currently only supports listening on a single endpoint, it
 // might be useful to support listening on multiple addresses (e.g. IPv4 and
 // IPv6, or a private and public address) via multiple Listen() calls.
-func (m *MConnTransport) Listen(endpoint Endpoint) error {
+func (m *MConnTransport) Listen(endpoint *Endpoint) error {
 	if m.listener != nil {
 		return errors.New("transport is already listening")
 	}
@@ -170,7 +171,7 @@ func (m *MConnTransport) Accept(ctx context.Context) (Connection, error) {
 }
 
 // Dial implements Transport.
-func (m *MConnTransport) Dial(ctx context.Context, endpoint Endpoint) (Connection, error) {
+func (m *MConnTransport) Dial(ctx context.Context, endpoint *Endpoint) (Connection, error) {
 	if err := m.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -217,7 +218,7 @@ func (m *MConnTransport) AddChannelDescriptors(channelDesc []*ChannelDescriptor)
 }
 
 // validateEndpoint validates an endpoint.
-func (m *MConnTransport) validateEndpoint(endpoint Endpoint) error {
+func (m *MConnTransport) validateEndpoint(endpoint *Endpoint) error {
 	if err := endpoint.Validate(); err != nil {
 		return err
 	}
@@ -274,6 +275,7 @@ func newMConnConnection(
 // Handshake implements Connection.
 func (c *mConnConnection) Handshake(
 	ctx context.Context,
+	timeout time.Duration,
 	nodeInfo types.NodeInfo,
 	privKey crypto.PrivKey,
 ) (types.NodeInfo, crypto.PubKey, error) {
@@ -283,6 +285,12 @@ func (c *mConnConnection) Handshake(
 		peerKey  crypto.PubKey
 		errCh    = make(chan error, 1)
 	)
+	handshakeCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		handshakeCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 	// To handle context cancellation, we need to do the handshake in a
 	// goroutine and abort the blocking network calls by closing the connection
 	// when the context is canceled.
@@ -295,25 +303,29 @@ func (c *mConnConnection) Handshake(
 			}
 		}()
 		var err error
-		mconn, peerInfo, peerKey, err = c.handshake(ctx, nodeInfo, privKey)
+		mconn, peerInfo, peerKey, err = c.handshake(handshakeCtx, nodeInfo, privKey)
 
 		select {
 		case errCh <- err:
-		case <-ctx.Done():
+		case <-handshakeCtx.Done():
 		}
 
 	}()
 
 	select {
-	case <-ctx.Done():
+	case <-handshakeCtx.Done():
 		_ = c.Close()
-		return types.NodeInfo{}, nil, ctx.Err()
+		return types.NodeInfo{}, nil, handshakeCtx.Err()
 
 	case err := <-errCh:
 		if err != nil {
 			return types.NodeInfo{}, nil, err
 		}
 		c.mconn = mconn
+		// Start must not use the handshakeCtx. The handshakeCtx may have a
+		// timeout set that is intended to terminate only the handshake procedure.
+		// The context passed to Start controls the entire lifecycle of the
+		// mconn.
 		if err = c.mconn.Start(ctx); err != nil {
 			return types.NodeInfo{}, nil, err
 		}

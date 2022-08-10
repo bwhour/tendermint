@@ -23,8 +23,8 @@ import (
 const (
 	checkFrequency    = 500 * time.Millisecond
 	defaultBufferSize = 2
-	shortWait         = 10 * time.Second
-	longWait          = 60 * time.Second
+	shortWait         = 5 * time.Second
+	longWait          = 20 * time.Second
 
 	firstNode  = 0
 	secondNode = 1
@@ -151,14 +151,14 @@ func TestReactorErrorsOnReceivingTooManyPeers(t *testing.T) {
 	defer cancel()
 
 	r := setupSingle(ctx, t)
-	peer := p2p.NodeAddress{Protocol: p2p.MemoryProtocol, NodeID: randomNodeID(t)}
+	peer := p2p.NodeAddress{Protocol: p2p.MemoryProtocol, NodeID: randomNodeID()}
 	added, err := r.manager.Add(peer)
 	require.NoError(t, err)
 	require.True(t, added)
 
 	addresses := make([]p2pproto.PexAddress, 101)
 	for i := 0; i < len(addresses); i++ {
-		nodeAddress := p2p.NodeAddress{Protocol: p2p.MemoryProtocol, NodeID: randomNodeID(t)}
+		nodeAddress := p2p.NodeAddress{Protocol: p2p.MemoryProtocol, NodeID: randomNodeID()}
 		addresses[i] = p2pproto.PexAddress{
 			URL: nodeAddress.String(),
 		}
@@ -211,7 +211,8 @@ func TestReactorSmallPeerStoreInALargeNetwork(t *testing.T) {
 		require.Eventually(t, func() bool {
 			// nolint:scopelint
 			return testNet.network.Nodes[nodeID].PeerManager.PeerRatio() >= 0.9
-		}, longWait, checkFrequency)
+		}, longWait, checkFrequency,
+			"peer ratio is: %f", testNet.network.Nodes[nodeID].PeerManager.PeerRatio())
 	}
 }
 
@@ -274,7 +275,7 @@ type singleTestReactor struct {
 	pexInCh  chan p2p.Envelope
 	pexOutCh chan p2p.Envelope
 	pexErrCh chan p2p.PeerError
-	pexCh    *p2p.Channel
+	pexCh    p2p.Channel
 	peerCh   chan p2p.PeerUpdate
 	manager  *p2p.PeerManager
 }
@@ -286,9 +287,11 @@ func setupSingle(ctx context.Context, t *testing.T) *singleTestReactor {
 	pexInCh := make(chan p2p.Envelope, chBuf)
 	pexOutCh := make(chan p2p.Envelope, chBuf)
 	pexErrCh := make(chan p2p.PeerError, chBuf)
+
+	chDesc := pex.ChannelDescriptor()
 	pexCh := p2p.NewChannel(
-		p2p.ChannelID(pex.PexChannel),
-		new(p2pproto.PexMessage),
+		chDesc.ID,
+		chDesc.Name,
 		pexInCh,
 		pexOutCh,
 		pexErrCh,
@@ -299,12 +302,11 @@ func setupSingle(ctx context.Context, t *testing.T) *singleTestReactor {
 	peerManager, err := p2p.NewPeerManager(nodeID, dbm.NewMemDB(), p2p.PeerManagerOptions{})
 	require.NoError(t, err)
 
-	chCreator := func(context.Context, *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+	chCreator := func(context.Context, *p2p.ChannelDescriptor) (p2p.Channel, error) {
 		return pexCh, nil
 	}
 
-	reactor, err := pex.NewReactor(ctx, log.NewNopLogger(), peerManager, chCreator, peerUpdates)
-	require.NoError(t, err)
+	reactor := pex.NewReactor(log.NewNopLogger(), peerManager, chCreator, func(_ context.Context) *p2p.PeerUpdates { return peerUpdates })
 
 	require.NoError(t, reactor.Start(ctx))
 	t.Cleanup(reactor.Wait)
@@ -325,7 +327,7 @@ type reactorTestSuite struct {
 	logger  log.Logger
 
 	reactors    map[types.NodeID]*pex.Reactor
-	pexChannels map[types.NodeID]*p2p.Channel
+	pexChannels map[types.NodeID]p2p.Channel
 
 	peerChans   map[types.NodeID]chan p2p.PeerUpdate
 	peerUpdates map[types.NodeID]*p2p.PeerUpdates
@@ -368,7 +370,7 @@ func setupNetwork(ctx context.Context, t *testing.T, opts testOptions) *reactorT
 		logger:      log.NewNopLogger().With("testCase", t.Name()),
 		network:     p2ptest.MakeNetwork(ctx, t, networkOpts),
 		reactors:    make(map[types.NodeID]*pex.Reactor, realNodes),
-		pexChannels: make(map[types.NodeID]*p2p.Channel, opts.TotalNodes),
+		pexChannels: make(map[types.NodeID]p2p.Channel, opts.TotalNodes),
 		peerChans:   make(map[types.NodeID]chan p2p.PeerUpdate, opts.TotalNodes),
 		peerUpdates: make(map[types.NodeID]*p2p.PeerUpdates, opts.TotalNodes),
 		total:       opts.TotalNodes,
@@ -381,11 +383,15 @@ func setupNetwork(ctx context.Context, t *testing.T, opts testOptions) *reactorT
 
 	idx := 0
 	for nodeID := range rts.network.Nodes {
+		// make a copy to avoid getting hit by the range ref
+		// confusion:
+		nodeID := nodeID
+
 		rts.peerChans[nodeID] = make(chan p2p.PeerUpdate, chBuf)
 		rts.peerUpdates[nodeID] = p2p.NewPeerUpdates(rts.peerChans[nodeID], chBuf)
 		rts.network.Nodes[nodeID].PeerManager.Register(ctx, rts.peerUpdates[nodeID])
 
-		chCreator := func(context.Context, *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+		chCreator := func(context.Context, *p2p.ChannelDescriptor) (p2p.Channel, error) {
 			return rts.pexChannels[nodeID], nil
 		}
 
@@ -393,15 +399,12 @@ func setupNetwork(ctx context.Context, t *testing.T, opts testOptions) *reactorT
 		if idx < opts.MockNodes {
 			rts.mocks = append(rts.mocks, nodeID)
 		} else {
-			var err error
-			rts.reactors[nodeID], err = pex.NewReactor(
-				ctx,
+			rts.reactors[nodeID] = pex.NewReactor(
 				rts.logger.With("nodeID", nodeID),
 				rts.network.Nodes[nodeID].PeerManager,
 				chCreator,
-				rts.peerUpdates[nodeID],
+				func(_ context.Context) *p2p.PeerUpdates { return rts.peerUpdates[nodeID] },
 			)
-			require.NoError(t, err)
 		}
 		rts.nodes = append(rts.nodes, nodeID)
 
@@ -426,9 +429,10 @@ func setupNetwork(ctx context.Context, t *testing.T, opts testOptions) *reactorT
 func (r *reactorTestSuite) start(ctx context.Context, t *testing.T) {
 	t.Helper()
 
-	for _, reactor := range r.reactors {
+	for name, reactor := range r.reactors {
 		require.NoError(t, reactor.Start(ctx))
 		require.True(t, reactor.IsRunning())
+		t.Log("started", name)
 	}
 }
 
@@ -447,19 +451,16 @@ func (r *reactorTestSuite) addNodes(ctx context.Context, t *testing.T, nodes int
 		r.peerUpdates[nodeID] = p2p.NewPeerUpdates(r.peerChans[nodeID], r.opts.BufferSize)
 		r.network.Nodes[nodeID].PeerManager.Register(ctx, r.peerUpdates[nodeID])
 
-		chCreator := func(context.Context, *p2p.ChannelDescriptor) (*p2p.Channel, error) {
+		chCreator := func(context.Context, *p2p.ChannelDescriptor) (p2p.Channel, error) {
 			return r.pexChannels[nodeID], nil
 		}
 
-		var err error
-		r.reactors[nodeID], err = pex.NewReactor(
-			ctx,
+		r.reactors[nodeID] = pex.NewReactor(
 			r.logger.With("nodeID", nodeID),
 			r.network.Nodes[nodeID].PeerManager,
 			chCreator,
-			r.peerUpdates[nodeID],
+			func(_ context.Context) *p2p.PeerUpdates { return r.peerUpdates[nodeID] },
 		)
-		require.NoError(t, err)
 		r.nodes = append(r.nodes, nodeID)
 		r.total++
 	}
@@ -731,6 +732,6 @@ func newNodeID(t *testing.T, id string) types.NodeID {
 	return nodeID
 }
 
-func randomNodeID(t *testing.T) types.NodeID {
+func randomNodeID() types.NodeID {
 	return types.NodeIDFromPubKey(ed25519.GenPrivKey().PubKey())
 }
